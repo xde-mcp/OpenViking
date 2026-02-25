@@ -30,6 +30,7 @@ from openviking.parse.parsers.media.utils import get_media_base_uri, get_media_t
 from openviking.server.identity import RequestContext
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.telemetry import get_current_telemetry
 from openviking.utils import parse_code_hosting_url
 from openviking_cli.utils.uri import VikingURI
 
@@ -220,5 +221,6 @@ class TreeBuilder:
             agent_id=ctx.user.agent_id,
             role=ctx.role.value,
             target_uri=final_uri,
+            telemetry_id=get_current_telemetry().telemetry_id,
         )
         await semantic_queue.enqueue(msg)

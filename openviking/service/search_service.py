@@ -10,6 +10,12 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
+from openviking.telemetry.search_hooks import (
+    on_find_done,
+    on_find_start,
+    on_search_done,
+    on_search_start,
+)
 from openviking_cli.exceptions import NotInitializedError
 from openviking_cli.utils import get_logger
 
@@ -59,12 +65,13 @@ class SearchService:
             FindResult
         """
         viking_fs = self._ensure_initialized()
+        on_search_start(target_uri_present=bool(target_uri), has_session=bool(session))
 
         session_info = None
         if session:
             session_info = await session.get_context_for_search(query)
 
-        return await viking_fs.search(
+        result = await viking_fs.search(
             query=query,
             ctx=ctx,
             target_uri=target_uri,
@@ -73,6 +80,8 @@ class SearchService:
             score_threshold=score_threshold,
             filter=filter,
         )
+        on_search_done(total=getattr(result, "total", 0))
+        return result
 
     async def find(
         self,
@@ -96,7 +105,8 @@ class SearchService:
             FindResult
         """
         viking_fs = self._ensure_initialized()
-        return await viking_fs.find(
+        on_find_start(target_uri_present=bool(target_uri))
+        result = await viking_fs.find(
             query=query,
             ctx=ctx,
             target_uri=target_uri,
@@ -104,3 +114,5 @@ class SearchService:
             score_threshold=score_threshold,
             filter=filter,
         )
+        on_find_done(total=getattr(result, "total", 0))
+        return result

@@ -7,12 +7,14 @@ Handles coordinated writes and self-iteration processes
 as described in the OpenViking design document.
 """
 
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.parse.tree_builder import TreeBuilder
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.telemetry import get_current_telemetry
 from openviking.utils.embedding_utils import index_resource
 from openviking.utils.summarizer import Summarizer
 from openviking_cli.utils import get_logger
@@ -119,9 +121,13 @@ class ResourceProcessor:
             "errors": [],
             "source_path": None,
         }
+        telemetry = get_current_telemetry()
+        telemetry.event("resource_processor", "process_start", {"path": path, "scope": scope})
 
         # ============ Phase 1: Parse source and writes to temp viking fs ============
         try:
+            parse_start = time.perf_counter()
+            telemetry.event("resource_processor.parse", "start", {"path": path})
             media_processor = self._get_media_processor()
             viking_fs = get_viking_fs()
             # Use reason as instruction fallback so it influences L0/L1
@@ -149,10 +155,22 @@ class ResourceProcessor:
             if parse_result.warnings:
                 result["errors"].extend(parse_result.warnings)
 
+            telemetry.event(
+                "resource_processor.parse",
+                "parse_done",
+                {
+                    "duration_ms": round((time.perf_counter() - parse_start) * 1000, 3),
+                    "warnings_count": len(parse_result.warnings or []),
+                    "has_temp_dir": bool(parse_result.temp_dir_path),
+                },
+            )
+            telemetry.set("resource.parse.warnings_count", len(parse_result.warnings or []))
+
         except Exception as e:
             result["status"] = "error"
             result["errors"].append(f"Parse error: {e}")
             logger.error(f"[ResourceProcessor] Parse error: {e}")
+            telemetry.set_error("resource_processor.parse", "PROCESSING_ERROR", str(e))
             import traceback
 
             traceback.print_exc()
@@ -166,6 +184,12 @@ class ResourceProcessor:
         # ============ Phase 2: Pass to and parent directly to TreeBuilder ============
         # ============ Phase 3: TreeBuilder finalizes from temp (scan + move to AGFS) ============
         try:
+            finalize_start = time.perf_counter()
+            telemetry.event(
+                "resource_processor.finalize",
+                "start",
+                {"temp_dir_path": parse_result.temp_dir_path},
+            )
             with get_viking_fs().bind_request_context(ctx):
                 context_tree = await self.tree_builder.finalize_from_temp(
                     temp_dir_path=parse_result.temp_dir_path,
@@ -179,9 +203,19 @@ class ResourceProcessor:
                 if context_tree and context_tree.root:
                     result["root_uri"] = context_tree.root.uri
                     result["temp_uri"] = context_tree.root.temp_uri
+            root_uri = result.get("root_uri") or getattr(context_tree, "_root_uri", "")
+            telemetry.event(
+                "resource_processor.finalize",
+                "finalize_done",
+                {
+                    "duration_ms": round((time.perf_counter() - finalize_start) * 1000, 3),
+                    "root_uri": root_uri,
+                },
+            )
         except Exception as e:
             result["status"] = "error"
             result["errors"].append(f"Finalize from temp error: {e}")
+            telemetry.set_error("resource_processor.finalize", "PROCESSING_ERROR", str(e))
 
             # Cleanup temporary directory on error (via VikingFS)
             try:
@@ -227,4 +261,11 @@ class ResourceProcessor:
                 logger.error(f"Auto-index failed: {e}")
                 result["warnings"] = result.get("warnings", []) + [f"Auto-index failed: {e}"]
 
+        if "root_uri" not in result:
+            result["root_uri"] = getattr(context_tree, "_root_uri", "")
+        telemetry.event(
+            "resource_processor",
+            "process_done",
+            {"root_uri": result["root_uri"]},
+        )
         return result

@@ -5,8 +5,6 @@
 
 import httpx
 
-from tests.server.conftest import SAMPLE_MD_CONTENT
-
 
 async def test_add_resource_success(client: httpx.AsyncClient, sample_markdown_file):
     resp = await client.post(
@@ -20,6 +18,9 @@ async def test_add_resource_success(client: httpx.AsyncClient, sample_markdown_f
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
+    assert "time" not in body
+    assert body["usage"]["duration_ms"] >= 0
+    assert body["usage"]["token_total"] >= 0
     assert "root_uri" in body["result"]
     assert body["result"]["root_uri"].startswith("viking://")
 
@@ -39,6 +40,72 @@ async def test_add_resource_with_wait(client: httpx.AsyncClient, sample_markdown
     assert "root_uri" in body["result"]
 
 
+async def test_add_resource_with_telemetry_wait(client: httpx.AsyncClient, sample_markdown_file):
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "path": str(sample_markdown_file),
+            "reason": "telemetry resource",
+            "wait": True,
+            "telemetry": True,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    telemetry_summary = body["telemetry"]["summary"]
+    assert telemetry_summary["operation"] == "resources.add_resource"
+    assert body["usage"]["duration_ms"] == telemetry_summary["duration_ms"]
+    assert body["usage"]["token_total"] == telemetry_summary["tokens"]["total"]
+    semantic = telemetry_summary["semantic_nodes"]
+    assert semantic["total"] is None or semantic["done"] == semantic["total"]
+    assert semantic["pending"] in (None, 0)
+    assert semantic["running"] in (None, 0)
+    assert "memory" not in telemetry_summary
+
+
+async def test_add_resource_with_summary_only_telemetry(
+    client: httpx.AsyncClient, sample_markdown_file
+):
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "path": str(sample_markdown_file),
+            "reason": "summary only telemetry resource",
+            "wait": True,
+            "telemetry": {"summary": True, "events": False},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "summary" in body["telemetry"]
+    assert "events" not in body["telemetry"]
+    assert "truncated" not in body["telemetry"]
+    assert "dropped" not in body["telemetry"]
+
+
+async def test_add_resource_allows_events_only_telemetry(
+    client: httpx.AsyncClient, sample_markdown_file
+):
+    resp = await client.post(
+        "/api/v1/resources",
+        json={
+            "path": str(sample_markdown_file),
+            "reason": "events only telemetry",
+            "wait": False,
+            "telemetry": {"summary": False, "events": True},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "summary" not in body["telemetry"]
+    assert "events" in body["telemetry"]
+    assert "truncated" in body["telemetry"]
+    assert "dropped" in body["telemetry"]
+
+
 async def test_add_resource_file_not_found(client: httpx.AsyncClient):
     resp = await client.post(
         "/api/v1/resources",
@@ -50,12 +117,12 @@ async def test_add_resource_file_not_found(client: httpx.AsyncClient):
     assert "errors" in body["result"] and len(body["result"]["errors"]) > 0
 
 
-async def test_add_resource_with_target(client: httpx.AsyncClient, sample_markdown_file):
+async def test_add_resource_with_to(client: httpx.AsyncClient, sample_markdown_file):
     resp = await client.post(
         "/api/v1/resources",
         json={
             "path": str(sample_markdown_file),
-            "target": "viking://resources/custom/",
+            "to": "viking://resources/custom/",
             "reason": "test resource",
         },
     )

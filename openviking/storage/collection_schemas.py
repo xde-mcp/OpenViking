@@ -10,17 +10,27 @@ similar to how init_viking_fs encapsulates VikingFS initialization.
 import asyncio
 import hashlib
 import json
-from typing import Any, Dict, Optional
+import threading
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from openviking.models.embedder.base import EmbedResult
 from openviking.storage.errors import CollectionNotFoundError
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
+from openviking.telemetry import bind_telemetry, resolve_telemetry
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class RequestQueueStats:
+    processed: int = 0
+    error_count: int = 0
 
 
 class CollectionSchemas:
@@ -127,6 +137,11 @@ class TextEmbeddingHandler(DequeueHandlerBase):
     Supports both dense and sparse embeddings based on configuration.
     """
 
+    _request_stats_lock = threading.Lock()
+    _request_stats_by_telemetry_id: Dict[str, RequestQueueStats] = {}
+    _request_stats_order: List[str] = []
+    _max_cached_stats = 1024
+
     def __init__(self, vikingdb: VikingVectorIndexBackend):
         """Initialize the text embedding handler.
 
@@ -145,6 +160,32 @@ class TextEmbeddingHandler(DequeueHandlerBase):
     def _initialize_embedder(self, config: "OpenVikingConfig"):
         """Initialize the embedder instance from config."""
         self._embedder = config.embedding.get_embedder()
+
+    @classmethod
+    def _merge_request_stats(
+        cls, telemetry_id: str, processed: int = 0, error_count: int = 0
+    ) -> None:
+        if not telemetry_id:
+            return
+        with cls._request_stats_lock:
+            stats = cls._request_stats_by_telemetry_id.setdefault(telemetry_id, RequestQueueStats())
+            stats.processed += processed
+            stats.error_count += error_count
+            cls._request_stats_order.append(telemetry_id)
+            if len(cls._request_stats_order) > cls._max_cached_stats:
+                old_telemetry_id = cls._request_stats_order.pop(0)
+                if (
+                    old_telemetry_id != telemetry_id
+                    and old_telemetry_id in cls._request_stats_by_telemetry_id
+                ):
+                    cls._request_stats_by_telemetry_id.pop(old_telemetry_id, None)
+
+    @classmethod
+    def consume_request_stats(cls, telemetry_id: str) -> Optional[RequestQueueStats]:
+        if not telemetry_id:
+            return None
+        with cls._request_stats_lock:
+            return cls._request_stats_by_telemetry_id.pop(telemetry_id, None)
 
     @staticmethod
     def _seed_uri_for_id(uri: str, level: Any) -> str:
@@ -165,102 +206,235 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         if not data:
             return None
 
+        embedding_msg: Optional[EmbeddingMsg] = None
+        collector = None
         try:
             queue_data = json.loads(data["data"])
             # Parse EmbeddingMsg from data
             embedding_msg = EmbeddingMsg.from_dict(queue_data)
             inserted_data = embedding_msg.context_data
+            collector = resolve_telemetry(embedding_msg.telemetry_id)
+            telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
 
-            if self._vikingdb.is_closing:
-                logger.debug("Skip embedding dequeue during shutdown")
-                self.report_success()
-                return None
-
-            # Only process string messages
-            if not isinstance(embedding_msg.message, str):
-                logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
-                self.report_success()
-                return data
-
-            # Initialize embedder if not already initialized
-            if not self._embedder:
-                from openviking_cli.utils.config import get_openviking_config
-
-                config = get_openviking_config()
-                self._initialize_embedder(config)
-
-            # Generate embedding vector(s)
-            if self._embedder:
-                # embed() is a blocking HTTP call; offload to thread pool to avoid
-                # blocking the event loop and allow real concurrency.
-                result: EmbedResult = await asyncio.to_thread(
-                    self._embedder.embed, embedding_msg.message
-                )
-
-                # Add dense vector
-                if result.dense_vector:
-                    inserted_data["vector"] = result.dense_vector
-                    # Validate vector dimension
-                    if len(result.dense_vector) != self._vector_dim:
-                        error_msg = f"Dense vector dimension mismatch: expected {self._vector_dim}, got {len(result.dense_vector)}"
-                        logger.error(error_msg)
-                        self.report_error(error_msg, data)
-                        return None
-
-                # Add sparse vector if present
-                if result.sparse_vector:
-                    inserted_data["sparse_vector"] = result.sparse_vector
-                    logger.debug(f"Generated sparse vector with {len(result.sparse_vector)} terms")
-            else:
-                error_msg = "Embedder not initialized, skipping vector generation"
-                logger.warning(error_msg)
-                self.report_error(error_msg, data)
-                return None
-
-            # Write to vector database
-            try:
-                # Ensure vector DB has deterministic IDs per semantic layer.
-                uri = inserted_data.get("uri")
-                if uri:
-                    account_id = inserted_data.get("account_id", "default")
-                    seed_uri = self._seed_uri_for_id(uri, inserted_data.get("level", 2))
-                    id_seed = f"{account_id}:{seed_uri}"
-                    inserted_data["id"] = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
-
-                record_id = await self._vikingdb.upsert(inserted_data)
-                if record_id:
-                    logger.debug(
-                        f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"
+            with telemetry_ctx:
+                if collector is not None:
+                    collector.event(
+                        "embedding_processor.request",
+                        "start",
+                        {
+                            "uri": inserted_data.get("uri", ""),
+                            "level": inserted_data.get("level", 2),
+                        },
                     )
-            except CollectionNotFoundError as db_err:
-                # During shutdown, queue workers may finish one dequeued item.
                 if self._vikingdb.is_closing:
-                    logger.debug(f"Skip embedding write during shutdown: {db_err}")
+                    logger.debug("Skip embedding dequeue during shutdown")
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    if collector is not None:
+                        collector.event(
+                            "embedding_processor.request",
+                            "done",
+                            {
+                                "uri": inserted_data.get("uri", ""),
+                                "level": inserted_data.get("level", 2),
+                                "shutdown_skip": True,
+                            },
+                        )
                     self.report_success()
                     return None
-                logger.error(f"Failed to write to vector database: {db_err}")
-                self.report_error(str(db_err), data)
-                return None
-            except Exception as db_err:
-                if self._vikingdb.is_closing:
-                    logger.debug(f"Skip embedding write during shutdown: {db_err}")
+
+                # Only process string messages
+                if not isinstance(embedding_msg.message, str):
+                    logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
+                    self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                    if collector is not None:
+                        collector.event(
+                            "embedding_processor.request",
+                            "done",
+                            {
+                                "uri": inserted_data.get("uri", ""),
+                                "level": inserted_data.get("level", 2),
+                                "skipped_non_string": True,
+                            },
+                        )
                     self.report_success()
+                    return data
+
+                # Initialize embedder if not already initialized
+                if not self._embedder:
+                    from openviking_cli.utils.config import get_openviking_config
+
+                    config = get_openviking_config()
+                    self._initialize_embedder(config)
+
+                # Generate embedding vector(s)
+                if self._embedder:
+                    # embed() is a blocking HTTP call; offload to thread pool to avoid
+                    # blocking the event loop and allow real concurrency.
+                    result: EmbedResult = await asyncio.to_thread(
+                        self._embedder.embed, embedding_msg.message
+                    )
+
+                    # Add dense vector
+                    if result.dense_vector:
+                        inserted_data["vector"] = result.dense_vector
+                        # Validate vector dimension
+                        if len(result.dense_vector) != self._vector_dim:
+                            error_msg = f"Dense vector dimension mismatch: expected {self._vector_dim}, got {len(result.dense_vector)}"
+                            logger.error(error_msg)
+                            self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                            if collector is not None:
+                                collector.event(
+                                    "embedding_processor.request",
+                                    "done",
+                                    {
+                                        "uri": inserted_data.get("uri", ""),
+                                        "level": inserted_data.get("level", 2),
+                                        "error": error_msg,
+                                    },
+                                    status="error",
+                                )
+                            self.report_error(error_msg, data)
+                            return None
+
+                    # Add sparse vector if present
+                    if result.sparse_vector:
+                        inserted_data["sparse_vector"] = result.sparse_vector
+                        logger.debug(
+                            f"Generated sparse vector with {len(result.sparse_vector)} terms"
+                        )
+                else:
+                    error_msg = "Embedder not initialized, skipping vector generation"
+                    logger.warning(error_msg)
+                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    if collector is not None:
+                        collector.event(
+                            "embedding_processor.request",
+                            "done",
+                            {
+                                "uri": inserted_data.get("uri", ""),
+                                "level": inserted_data.get("level", 2),
+                                "error": error_msg,
+                            },
+                            status="error",
+                        )
+                    self.report_error(error_msg, data)
                     return None
-                logger.error(f"Failed to write to vector database: {db_err}")
-                import traceback
 
-                traceback.print_exc()
-                self.report_error(str(db_err), data)
-                return None
+                # Write to vector database
+                try:
+                    # Ensure vector DB has deterministic IDs per semantic layer.
+                    uri = inserted_data.get("uri")
+                    if uri:
+                        account_id = inserted_data.get("account_id", "default")
+                        seed_uri = self._seed_uri_for_id(uri, inserted_data.get("level", 2))
+                        id_seed = f"{account_id}:{seed_uri}"
+                        inserted_data["id"] = hashlib.md5(id_seed.encode("utf-8")).hexdigest()
 
-            self.report_success()
-            return inserted_data
+                    record_id = await self._vikingdb.upsert(inserted_data)
+                    if record_id:
+                        logger.debug(
+                            f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"
+                        )
+                except CollectionNotFoundError as db_err:
+                    # During shutdown, queue workers may finish one dequeued item.
+                    if self._vikingdb.is_closing:
+                        logger.debug(f"Skip embedding write during shutdown: {db_err}")
+                        self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                        if collector is not None:
+                            collector.event(
+                                "embedding_processor.request",
+                                "done",
+                                {
+                                    "uri": inserted_data.get("uri", ""),
+                                    "level": inserted_data.get("level", 2),
+                                    "shutdown_skip": True,
+                                },
+                            )
+                        self.report_success()
+                        return None
+                    logger.error(f"Failed to write to vector database: {db_err}")
+                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    if collector is not None:
+                        collector.event(
+                            "embedding_processor.request",
+                            "done",
+                            {
+                                "uri": inserted_data.get("uri", ""),
+                                "level": inserted_data.get("level", 2),
+                                "error": str(db_err),
+                            },
+                            status="error",
+                        )
+                    self.report_error(str(db_err), data)
+                    return None
+                except Exception as db_err:
+                    if self._vikingdb.is_closing:
+                        logger.debug(f"Skip embedding write during shutdown: {db_err}")
+                        self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                        if collector is not None:
+                            collector.event(
+                                "embedding_processor.request",
+                                "done",
+                                {
+                                    "uri": inserted_data.get("uri", ""),
+                                    "level": inserted_data.get("level", 2),
+                                    "shutdown_skip": True,
+                                },
+                            )
+                        self.report_success()
+                        return None
+                    logger.error(f"Failed to write to vector database: {db_err}")
+                    import traceback
+
+                    traceback.print_exc()
+                    self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+                    if collector is not None:
+                        collector.event(
+                            "embedding_processor.request",
+                            "done",
+                            {
+                                "uri": inserted_data.get("uri", ""),
+                                "level": inserted_data.get("level", 2),
+                                "error": str(db_err),
+                            },
+                            status="error",
+                        )
+                    self.report_error(str(db_err), data)
+                    return None
+
+                self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                if collector is not None:
+                    collector.event(
+                        "embedding_processor.request",
+                        "done",
+                        {
+                            "uri": inserted_data.get("uri", ""),
+                            "level": inserted_data.get("level", 2),
+                            "has_sparse_vector": bool(inserted_data.get("sparse_vector")),
+                        },
+                    )
+                self.report_success()
+                return inserted_data
 
         except Exception as e:
             logger.error(f"Error processing embedding message: {e}")
             import traceback
 
             traceback.print_exc()
+            if embedding_msg is not None:
+                self._merge_request_stats(embedding_msg.telemetry_id, error_count=1)
+            if collector is not None and embedding_msg is not None:
+                with bind_telemetry(collector):
+                    collector.event(
+                        "embedding_processor.request",
+                        "done",
+                        {
+                            "uri": embedding_msg.context_data.get("uri", ""),
+                            "level": embedding_msg.context_data.get("level", 2),
+                            "error": str(e),
+                        },
+                        status="error",
+                    )
             self.report_error(str(e), data)
             return None
         finally:

@@ -15,6 +15,12 @@ from uuid import uuid4
 
 from openviking.message import Message, Part
 from openviking.server.identity import RequestContext, Role
+from openviking.telemetry.session_hooks import (
+    on_commit_done,
+    on_commit_done_with_memory,
+    on_commit_start,
+    on_memory_extracted,
+)
 from openviking.utils.time_utils import get_current_timestamp
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger, run_async
@@ -228,6 +234,7 @@ class Session:
 
     def commit(self) -> Dict[str, Any]:
         """Commit session: create archive, extract memories, persist."""
+        on_commit_start(self.session_id)
         result = {
             "session_id": self.session_id,
             "status": "committed",
@@ -237,6 +244,7 @@ class Session:
             "stats": None,
         }
         if not self._messages:
+            on_commit_done_with_memory(0)
             return result
 
         # 1. Archive current messages
@@ -278,6 +286,7 @@ class Session:
             logger.info(f"Extracted {len(memories)} memories")
             result["memories_extracted"] = len(memories)
             self._stats.memories_extracted += len(memories)
+            on_memory_extracted(len(memories))
 
         # 3. Write current messages to AGFS
         self._write_to_agfs(self._messages)
@@ -300,6 +309,7 @@ class Session:
 
         self._stats.total_tokens = 0
         logger.info(f"Session {self.session_id} committed")
+        on_commit_done(result["memories_extracted"])
         return result
 
     def _create_temp_uris(self) -> Tuple[str, str, str, str]:
@@ -359,29 +369,22 @@ class Session:
         3. Semantic: Trigger semantic processing
         4. Switch: Atomically switch from temp to target (handled by SemanticProcessor)
         """
+        on_commit_start(self.session_id)
         result = {
             "session_id": self.session_id,
             "status": "committed",
             "memories_extracted": 0,
             "active_count_updated": 0,
             "archived": False,
-            "temp_base_uri": None,
-            "session_temp_uri": None,
-            "user_temp_uri": None,
-            "agent_temp_uri": None,
-            "semantic_msg_id": None,
             "stats": None,
         }
 
         if not self._messages:
+            on_commit_done_with_memory(0)
             return result
 
         # ========== Phase 1: Copy ==========
         temp_base_uri, session_temp_uri, user_temp_uri, agent_temp_uri = self._create_temp_uris()
-        result["temp_base_uri"] = temp_base_uri
-        result["session_temp_uri"] = session_temp_uri
-        result["user_temp_uri"] = user_temp_uri
-        result["agent_temp_uri"] = agent_temp_uri
 
         try:
             # 1.1 Copy existing session to temp
@@ -449,10 +452,6 @@ class Session:
                 temp_uri=session_temp_uri,
                 index=self._compression.compression_index,
                 messages=messages_to_archive,
-                user=self.user,
-                session_id=self.session_id,
-                ctx=self.ctx,
-                strict_extract_errors=True,
             )
 
             self._compression.original_count += len(messages_to_archive)
@@ -480,6 +479,7 @@ class Session:
                 logger.info(f"Extracted {len(memories)} memories to temp directories")
                 result["memories_extracted"] = len(memories)
                 self._stats.memories_extracted += len(memories)
+                on_memory_extracted(len(memories))
 
             # 2.3 Write current messages to temp
             await self._write_messages_to_temp(session_temp_uri, self._messages)
@@ -502,7 +502,6 @@ class Session:
             )
 
             logger.info(f"Session, user, agent enqueued to SemanticQueue: {semantic_msg_ids}")
-            result["semantic_msg_ids"] = semantic_msg_ids
 
         except Exception as e:
             logger.error(f"Failed to enqueue to SemanticQueue: {e}")
@@ -520,6 +519,7 @@ class Session:
 
         self._stats.total_tokens = 0
         logger.info(f"Session {self.session_id} committed (async with COW pattern)")
+        on_commit_done(result["memories_extracted"])
         return result
 
     def _update_active_counts(self) -> int:

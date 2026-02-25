@@ -16,6 +16,18 @@ from openviking.retrieve.memory_lifecycle import hotness_score
 from openviking.server.identity import RequestContext, Role
 from openviking.storage import VikingVectorIndexBackend
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.telemetry.retriever_hooks import (
+    count_vector_passed,
+    count_vector_search,
+    on_collection_missing,
+    on_directory_entered,
+    on_directory_results,
+    on_global_search_done,
+    on_recursive_search_done,
+    on_retrieve_done,
+    on_retrieve_start,
+    on_starting_points_merged,
+)
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.retrieve.types import (
     ContextType,
@@ -99,6 +111,10 @@ class HierarchicalRetriever:
             grep_patterns: Keyword match pattern list
             scope_dsl: Additional scope constraints passed from public find/search filter
         """
+        on_retrieve_start(
+            context_type=query.context_type.value if query.context_type else "all",
+            limit=limit,
+        )
 
         # Use custom threshold or default threshold
         effective_threshold = score_threshold if score_threshold is not None else self.threshold
@@ -110,6 +126,7 @@ class HierarchicalRetriever:
                 "[RecursiveSearch] Collection %s does not exist",
                 self.vector_store.collection_name,
             )
+            on_collection_missing(collection=self.vector_store.collection_name)
             return QueryResult(
                 query=query,
                 matched_contexts=[],
@@ -140,9 +157,11 @@ class HierarchicalRetriever:
             scope_dsl=scope_dsl,
             limit=self.GLOBAL_SEARCH_TOPK,
         )
+        on_global_search_done(hits=len(global_results))
 
         # Step 3: Merge starting points
         starting_points = self._merge_starting_points(query.query, root_uris, global_results)
+        on_starting_points_merged(count=len(starting_points))
 
         # Step 4: Recursive search
         candidates = await self._recursive_search(
@@ -159,9 +178,11 @@ class HierarchicalRetriever:
             target_dirs=target_dirs,
             scope_dsl=scope_dsl,
         )
+        on_recursive_search_done(candidates=len(candidates))
 
         # Step 6: Convert results
         matched = await self._convert_to_matched_contexts(candidates, ctx=ctx)
+        on_retrieve_done(matched_contexts=len(matched[:limit]))
 
         return QueryResult(
             query=query,
@@ -189,6 +210,7 @@ class HierarchicalRetriever:
             extra_filter=scope_dsl,
             limit=limit,
         )
+        count_vector_search(scored=len(results))
         return results
 
     def _merge_starting_points(
@@ -283,6 +305,7 @@ class HierarchicalRetriever:
                 continue
             visited.add(current_uri)
             logger.info(f"[RecursiveSearch] Entering URI: {current_uri}")
+            on_directory_entered(uri=current_uri, queue_size=len(dir_queue))
 
             pre_filter_limit = max(limit * 2, 20)
 
@@ -296,6 +319,8 @@ class HierarchicalRetriever:
                 extra_filter=scope_dsl,
                 limit=pre_filter_limit,
             )
+            count_vector_search(scored=len(results))
+            on_directory_results(uri=current_uri, hits=len(results))
 
             if not results:
                 continue
@@ -326,6 +351,7 @@ class HierarchicalRetriever:
                     )
                     continue
 
+                count_vector_passed()
                 # Deduplicate by URI and keep the highest-scored candidate.
                 previous = collected_by_uri.get(uri)
                 if previous is None or final_score > previous.get("_final_score", 0):

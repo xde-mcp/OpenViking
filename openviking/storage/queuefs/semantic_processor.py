@@ -5,6 +5,8 @@
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+import threading
+from contextlib import nullcontext
 
 from openviking.parse.parsers.constants import (
     CODE_EXTENSIONS,
@@ -25,6 +27,7 @@ from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.viking_fs import get_viking_fs
+from openviking.telemetry import bind_telemetry, resolve_telemetry
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
@@ -46,6 +49,12 @@ class DiffResult:
     deleted_dirs: List[str] = field(default_factory=list)
 
 
+@dataclass
+class RequestQueueStats:
+    processed: int = 0
+    error_count: int = 0
+
+
 class SemanticProcessor(DequeueHandlerBase):
     """
     Semantic processor, generates .abstract.md and .overview.md bottom-up.
@@ -56,6 +65,14 @@ class SemanticProcessor(DequeueHandlerBase):
     3. Generate .abstract.md and .overview.md for this directory
     4. Enqueue to EmbeddingQueue for vectorization
     """
+
+    _dag_stats_lock = threading.Lock()
+    _dag_stats_by_telemetry_id: Dict[str, DagStats] = {}
+    _dag_stats_by_uri: Dict[str, DagStats] = {}
+    _dag_stats_order: List[Tuple[str, str]] = []
+    _request_stats_by_telemetry_id: Dict[str, RequestQueueStats] = {}
+    _request_stats_order: List[str] = []
+    _max_cached_stats = 256
 
     def __init__(self, max_concurrent_llm: int = 100):
         """
@@ -68,6 +85,57 @@ class SemanticProcessor(DequeueHandlerBase):
         self._dag_executor: Optional[SemanticDagExecutor] = None
         self._current_ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
         self._current_msg: Optional[SemanticMsg] = None
+
+    @classmethod
+    def _cache_dag_stats(cls, telemetry_id: str, uri: str, stats: DagStats) -> None:
+        with cls._dag_stats_lock:
+            if telemetry_id:
+                cls._dag_stats_by_telemetry_id[telemetry_id] = stats
+            cls._dag_stats_by_uri[uri] = stats
+            cls._dag_stats_order.append((telemetry_id, uri))
+            if len(cls._dag_stats_order) > cls._max_cached_stats:
+                old_telemetry_id, old_uri = cls._dag_stats_order.pop(0)
+                if old_telemetry_id:
+                    cls._dag_stats_by_telemetry_id.pop(old_telemetry_id, None)
+                cls._dag_stats_by_uri.pop(old_uri, None)
+
+    @classmethod
+    def consume_dag_stats(
+        cls,
+        telemetry_id: str = "",
+        uri: Optional[str] = None,
+    ) -> Optional[DagStats]:
+        """Consume cached request-level DAG stats if available."""
+        with cls._dag_stats_lock:
+            if telemetry_id and telemetry_id in cls._dag_stats_by_telemetry_id:
+                stats = cls._dag_stats_by_telemetry_id.pop(telemetry_id, None)
+                if uri:
+                    cls._dag_stats_by_uri.pop(uri, None)
+                return stats
+            if uri and uri in cls._dag_stats_by_uri:
+                return cls._dag_stats_by_uri.pop(uri, None)
+        return None
+
+    @classmethod
+    def _cache_request_stats(cls, telemetry_id: str, processed: int, error_count: int) -> None:
+        if not telemetry_id:
+            return
+        with cls._dag_stats_lock:
+            cls._request_stats_by_telemetry_id[telemetry_id] = RequestQueueStats(
+                processed=processed,
+                error_count=error_count,
+            )
+            cls._request_stats_order.append(telemetry_id)
+            if len(cls._request_stats_order) > cls._max_cached_stats:
+                old_telemetry_id = cls._request_stats_order.pop(0)
+                cls._request_stats_by_telemetry_id.pop(old_telemetry_id, None)
+
+    @classmethod
+    def consume_request_stats(cls, telemetry_id: str) -> Optional[RequestQueueStats]:
+        if not telemetry_id:
+            return None
+        with cls._dag_stats_lock:
+            return cls._request_stats_by_telemetry_id.pop(telemetry_id, None)
 
     @staticmethod
     def _owner_space_for_uri(uri: str, ctx: RequestContext) -> str:
@@ -131,7 +199,8 @@ class SemanticProcessor(DequeueHandlerBase):
 
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Process dequeued SemanticMsg, recursively process all subdirectories."""
-        msg = None
+        msg: Optional[SemanticMsg] = None
+        collector = None
         try:
             import json
 
@@ -144,51 +213,140 @@ class SemanticProcessor(DequeueHandlerBase):
             # data is guaranteed to be not None at this point
             assert data is not None
             msg = SemanticMsg.from_dict(data)
-            self._current_msg = msg
-            self._current_ctx = self._ctx_from_semantic_msg(msg)
-            logger.info(f"Processing semantic generation for: {msg})")
+            collector = resolve_telemetry(msg.telemetry_id)
+            telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
+            with telemetry_ctx:
+                if collector is not None:
+                    collector.event(
+                        "semantic_processor.request",
+                        "start",
+                        {"uri": msg.uri, "recursive": msg.recursive},
+                    )
+                self._current_msg = msg
+                self._current_ctx = self._ctx_from_semantic_msg(msg)
+                logger.info(
+                    f"Processing semantic generation for: {msg.uri} (recursive={msg.recursive})"
+                )
 
-            # Check if target_uri exists, auto-detect incremental update
-            is_incremental = False
-            viking_fs = get_viking_fs()
-            if msg.target_uri:
-                target_exists = await viking_fs.exists(msg.target_uri, ctx=self._current_ctx)
-                if target_exists:
-                    is_incremental = True
-                    logger.info(f"Target URI exists, using incremental update: {msg.target_uri}")
+                is_incremental = False
+                viking_fs = get_viking_fs()
+                if msg.target_uri:
+                    target_exists = await viking_fs.exists(msg.target_uri, ctx=self._current_ctx)
+                    if target_exists:
+                        is_incremental = True
+                        logger.info(f"Target URI exists, using incremental update: {msg.target_uri}")
 
-            tracker = EmbeddingTaskTracker.get_instance()
-            on_complete = self._create_sync_diff_callback(
-                root_uri=msg.uri,
-                target_uri=msg.target_uri,
-                ctx=self._current_ctx,
-            )
-            # Register task with tracker, total_count=1 for root URI
-            await tracker.register(
-                semantic_msg_id=msg.id,
-                total_count=1,
-                on_complete=on_complete,
-                metadata={
-                    "uri": msg.uri,
-                },
-            )
-            executor = SemanticDagExecutor(
-                processor=self,
-                context_type=msg.context_type,
-                max_concurrent_llm=self.max_concurrent_llm,
-                ctx=self._current_ctx,
-                incremental_update=is_incremental,
-                target_uri=msg.target_uri,
-                semantic_msg_id=msg.id,
-                recursive=msg.recursive,
-            )
-            self._dag_executor = executor
-            await executor.run(msg.uri)
-            logger.info(f"Completed semantic generation for: {msg.uri}")
-            self.report_success()
-            return None
+                tracker = EmbeddingTaskTracker.get_instance()
+                on_complete = None
+                if msg.target_uri:
+                    on_complete = self._create_sync_diff_callback(
+                        root_uri=msg.uri,
+                        target_uri=msg.target_uri,
+                        ctx=self._current_ctx,
+                    )
+                await tracker.register(
+                    semantic_msg_id=msg.id,
+                    total_count=1,
+                    on_complete=on_complete,
+                    metadata={"uri": msg.uri},
+                )
+
+                if msg.recursive:
+                    executor = SemanticDagExecutor(
+                        processor=self,
+                        context_type=msg.context_type,
+                        max_concurrent_llm=self.max_concurrent_llm,
+                        ctx=self._current_ctx,
+                        incremental_update=is_incremental,
+                        target_uri=msg.target_uri,
+                        semantic_msg_id=msg.id,
+                        recursive=msg.recursive,
+                    )
+                    self._dag_executor = executor
+                    await executor.run(msg.uri)
+                    stats = executor.get_stats()
+                    self._cache_dag_stats(msg.telemetry_id, msg.uri, stats)
+                    self._cache_request_stats(msg.telemetry_id, processed=1, error_count=0)
+                    if collector is not None:
+                        collector.event(
+                            "semantic_processor.request",
+                            "done",
+                            {
+                                "uri": msg.uri,
+                                "recursive": msg.recursive,
+                                "total_nodes": stats.total_nodes,
+                                "done_nodes": stats.done_nodes,
+                            },
+                        )
+                    logger.info(f"Completed semantic generation for: {msg.uri}")
+                    self.report_success()
+                    return None
+                else:
+                    # Non-recursive processing: directly process this directory
+                    children_uris = []
+                    file_paths = []
+
+                    # Collect immediate children info only (no recursion)
+                    viking_fs = get_viking_fs()
+                    try:
+                        entries = await viking_fs.ls(msg.uri, ctx=self._current_ctx)
+                        for entry in entries:
+                            name = entry.get("name", "")
+                            if not name or name.startswith(".") or name in [".", ".."]:
+                                continue
+
+                            item_uri = VikingURI(msg.uri).join(name).uri
+
+                            if entry.get("isDir", False):
+                                children_uris.append(item_uri)
+                            else:
+                                file_paths.append(item_uri)
+                    except Exception as e:
+                        logger.warning(f"Failed to list directory {msg.uri}: {e}")
+
+                    # Process this directory
+                    await self._process_single_directory(
+                        uri=msg.uri,
+                        context_type=msg.context_type,
+                        children_uris=children_uris,
+                        file_paths=file_paths,
+                        ctx=self._current_ctx,
+                        semantic_msg_id=msg.id,
+                    )
+                    # Non-recursive branch still has one logical node.
+                    self._cache_dag_stats(
+                        msg.telemetry_id,
+                        msg.uri,
+                        DagStats(total_nodes=1, pending_nodes=0, in_progress_nodes=0, done_nodes=1),
+                    )
+                    self._cache_request_stats(msg.telemetry_id, processed=1, error_count=0)
+                    if collector is not None:
+                        collector.event(
+                            "semantic_processor.request",
+                            "done",
+                            {
+                                "uri": msg.uri,
+                                "recursive": msg.recursive,
+                                "total_nodes": 1,
+                                "done_nodes": 1,
+                            },
+                        )
+
+                    logger.info(f"Completed semantic generation for: {msg.uri}")
+                    self.report_success()
+                    return None
 
         except Exception as e:
+            if msg is not None:
+                self._cache_request_stats(msg.telemetry_id, processed=0, error_count=1)
+            if collector is not None and msg is not None:
+                with bind_telemetry(collector):
+                    collector.event(
+                        "semantic_processor.request",
+                        "done",
+                        {"uri": msg.uri, "recursive": msg.recursive, "error": str(e)},
+                        status="error",
+                    )
             logger.error(f"Failed to process semantic message: {e}", exc_info=True)
             self.report_error(str(e), data)
             return None
@@ -206,6 +364,61 @@ class SemanticProcessor(DequeueHandlerBase):
         if not self._dag_executor:
             return None
         return self._dag_executor.get_stats()
+
+    async def _process_single_directory(
+        self,
+        uri: str,
+        context_type: str,
+        children_uris: List[str],
+        file_paths: List[str],
+        ctx: Optional[RequestContext] = None,
+        semantic_msg_id: Optional[str] = None,
+    ) -> None:
+        """Process a single directory without recursive DAG dispatch."""
+        active_ctx = ctx or self._current_ctx
+        viking_fs = get_viking_fs()
+
+        children_abstracts = await self._collect_children_abstracts(children_uris, ctx=active_ctx)
+        llm_sem = asyncio.Semaphore(self.max_concurrent_llm)
+
+        async def generate_one_summary(file_path: str) -> Dict[str, str]:
+            summary = await self._generate_single_file_summary(
+                file_path,
+                llm_sem=llm_sem,
+                ctx=active_ctx,
+            )
+            if not getattr(self._current_msg, "skip_vectorization", False):
+                try:
+                    await self._vectorize_single_file(
+                        parent_uri=uri,
+                        context_type=context_type,
+                        file_path=file_path,
+                        summary_dict=summary,
+                        ctx=active_ctx,
+                        semantic_msg_id=semantic_msg_id,
+                    )
+                except Exception as exc:
+                    logger.error(f"Failed to vectorize file {file_path}: {exc}", exc_info=True)
+            return summary
+
+        file_summaries = await asyncio.gather(*(generate_one_summary(fp) for fp in file_paths))
+        overview = await self._generate_overview(uri, file_summaries, children_abstracts)
+        abstract = self._extract_abstract_from_overview(overview)
+
+        await viking_fs.write_file(f"{uri}/.overview.md", overview, ctx=active_ctx)
+        await viking_fs.write_file(f"{uri}/.abstract.md", abstract, ctx=active_ctx)
+
+        try:
+            await self._vectorize_directory(
+                uri=uri,
+                context_type=context_type,
+                abstract=abstract,
+                overview=overview,
+                ctx=active_ctx,
+                semantic_msg_id=semantic_msg_id,
+            )
+        except Exception as exc:
+            logger.error(f"Failed to vectorize directory {uri}: {exc}", exc_info=True)
 
     def _create_sync_diff_callback(
         self,
@@ -734,6 +947,25 @@ class SemanticProcessor(DequeueHandlerBase):
             semantic_msg_id=semantic_msg_id,
         )
 
+    async def _vectorize_directory_simple(
+        self,
+        uri: str,
+        context_type: str,
+        abstract: str,
+        overview: str,
+        ctx: Optional[RequestContext] = None,
+        semantic_msg_id: Optional[str] = None,
+    ) -> None:
+        """Backward-compatible wrapper for direct directory vectorization."""
+        await self._vectorize_directory(
+            uri=uri,
+            context_type=context_type,
+            abstract=abstract,
+            overview=overview,
+            ctx=ctx,
+            semantic_msg_id=semantic_msg_id,
+        )
+
     async def _vectorize_single_file(
         self,
         parent_uri: str,
@@ -744,6 +976,10 @@ class SemanticProcessor(DequeueHandlerBase):
         semantic_msg_id: Optional[str] = None,
     ) -> None:
         """Vectorize a single file using its content or summary."""
+        if self._current_msg and getattr(self._current_msg, "skip_vectorization", False):
+            logger.info(f"Skipping vectorization for {file_path} (requested via SemanticMsg)")
+            return
+
         from openviking.utils.embedding_utils import vectorize_file
 
         tracker = EmbeddingTaskTracker.get_instance()

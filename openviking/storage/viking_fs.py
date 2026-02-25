@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 from openviking.pyagfs.exceptions import AGFSHTTPError
 from openviking.pyagfs.helpers import cp as agfs_cp
 from openviking.server.identity import RequestContext, Role
+from openviking.telemetry import get_current_telemetry
 from openviking.utils.time_utils import format_simplified, get_current_timestamp, parse_iso_datetime
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -623,6 +624,16 @@ class VikingFS:
         Returns:
             FindResult
         """
+        telemetry = get_current_telemetry()
+        telemetry.event(
+            "vikingfs.find",
+            "find_start",
+            {
+                "query_len": len(query),
+                "target_uri_present": bool(target_uri),
+                "limit": limit,
+            },
+        )
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking_cli.retrieve import (
             ContextType,
@@ -677,11 +688,18 @@ class VikingFS:
             elif ctx.context_type == ContextType.SKILL:
                 skills.append(ctx)
 
-        return FindResult(
+        find_result = FindResult(
             memories=memories,
             resources=resources,
             skills=skills,
         )
+        telemetry.set("vector.returned", find_result.total)
+        telemetry.event(
+            "vikingfs.find",
+            "find_done",
+            {"total": find_result.total},
+        )
+        return find_result
 
     async def search(
         self,
@@ -705,6 +723,17 @@ class VikingFS:
         Returns:
             FindResult
         """
+        telemetry = get_current_telemetry()
+        telemetry.event(
+            "vikingfs.search",
+            "search_start",
+            {
+                "query_len": len(query),
+                "target_uri_present": bool(target_uri),
+                "session_info_present": bool(session_info),
+                "limit": limit,
+            },
+        )
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking.retrieve.intent_analyzer import IntentAnalyzer
         from openviking_cli.retrieve import (
@@ -775,6 +804,12 @@ class VikingFS:
                     )
                     for ctx_type in [ContextType.MEMORY, ContextType.RESOURCE, ContextType.SKILL]
                 ]
+        telemetry.set("search.typed_queries_count", len(typed_queries))
+        telemetry.event(
+            "vikingfs.search",
+            "typed_queries_built",
+            {"count": len(typed_queries)},
+        )
 
         # Concurrent execution
         storage = self._get_vector_store()
@@ -807,13 +842,20 @@ class VikingFS:
                 elif ctx.context_type == ContextType.SKILL:
                     skills.append(ctx)
 
-        return FindResult(
+        find_result = FindResult(
             memories=memories,
             resources=resources,
             skills=skills,
             query_plan=query_plan,
             query_results=query_results,
         )
+        telemetry.set("vector.returned", find_result.total)
+        telemetry.event(
+            "vikingfs.search",
+            "search_done",
+            {"total": find_result.total},
+        )
+        return find_result
 
     # ========== Relation Management ==========
 

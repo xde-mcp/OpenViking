@@ -6,12 +6,33 @@ Resource Service for OpenViking.
 Provides resource management operations: add_resource, add_skill, wait_processed.
 """
 
+import time
 from typing import Any, Dict, List, Optional
 
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.queuefs import get_queue_manager
 from openviking.storage.viking_fs import VikingFS
+from openviking.telemetry.resource_hooks import (
+    on_add_resource_done,
+    on_add_resource_error,
+    on_add_resource_start,
+    on_add_skill_queue_wait_complete,
+    on_add_skill_queue_wait_timeout,
+    on_add_skill_start,
+    on_queue_status_collected,
+    on_queue_wait_complete,
+    on_queue_wait_start,
+    on_queue_wait_timeout,
+    on_resource_processed,
+    on_skill_processed,
+)
+from openviking.telemetry.resource_summary import (
+    build_queue_status_payload,
+    record_resource_wait_metrics,
+    register_wait_telemetry,
+    unregister_wait_telemetry,
+)
 from openviking.utils.resource_processor import ResourceProcessor
 from openviking.utils.skill_processor import SkillProcessor
 from openviking_cli.exceptions import (
@@ -93,50 +114,75 @@ class ResourceService:
             Processing result
         """
         self._ensure_initialized()
+        request_start = time.perf_counter()
+        on_add_resource_start(wait=wait, has_target=bool(to or parent))
+        telemetry_id = register_wait_telemetry(wait)
 
-        # add_resource only supports resources scope
-        if to and to.startswith("viking://"):
-            parsed = VikingURI(to)
-            if parsed.scope != "resources":
-                raise InvalidArgumentError(
-                    f"add_resource only supports resources scope, use dedicated interface to add {parsed.scope} content"
+        try:
+            # add_resource only supports resources scope
+            if to and to.startswith("viking://"):
+                parsed = VikingURI(to)
+                if parsed.scope != "resources":
+                    raise InvalidArgumentError(
+                        f"add_resource only supports resources scope, use dedicated interface to add {parsed.scope} content"
+                    )
+            if parent and parent.startswith("viking://"):
+                parsed = VikingURI(parent)
+                if parsed.scope != "resources":
+                    raise InvalidArgumentError(
+                        f"add_resource only supports resources scope, use dedicated interface to add {parsed.scope} content"
+                    )
+
+            result = await self._resource_processor.process_resource(
+                path=path,
+                ctx=ctx,
+                reason=reason,
+                instruction=instruction,
+                scope="resources",
+                to=to,
+                parent=parent,
+                build_index=build_index,
+                summarize=summarize,
+                **kwargs,
+            )
+            on_resource_processed(status=result.get("status", ""))
+
+            if wait:
+                qm = get_queue_manager()
+                wait_start = time.perf_counter()
+                on_queue_wait_start(timeout=timeout)
+                try:
+                    status = await qm.wait_complete(timeout=timeout)
+                except TimeoutError as exc:
+                    on_queue_wait_timeout(exc)
+                    raise DeadlineExceededError("queue processing", timeout) from exc
+                on_queue_wait_complete(
+                    duration_ms=round((time.perf_counter() - wait_start) * 1000, 3)
                 )
-        if parent and parent.startswith("viking://"):
-            parsed = VikingURI(parent)
-            if parsed.scope != "resources":
-                raise InvalidArgumentError(
-                    f"add_resource only supports resources scope, use dedicated interface to add {parsed.scope} content"
+                result["queue_status"] = build_queue_status_payload(status)
+                queue_summary = record_resource_wait_metrics(
+                    telemetry_id=telemetry_id,
+                    queue_status=status,
+                    root_uri=result.get("root_uri"),
                 )
+                on_queue_status_collected(queue_summary=queue_summary)
 
-        result = await self._resource_processor.process_resource(
-            path=path,
-            ctx=ctx,
-            reason=reason,
-            instruction=instruction,
-            scope="resources",
-            to=to,
-            parent=parent,
-            build_index=build_index,
-            summarize=summarize,
-            **kwargs,
-        )
-
-        if wait:
-            qm = get_queue_manager()
-            try:
-                status = await qm.wait_complete(timeout=timeout)
-            except TimeoutError as exc:
-                raise DeadlineExceededError("queue processing", timeout) from exc
-            result["queue_status"] = {
-                name: {
-                    "processed": s.processed,
-                    "error_count": s.error_count,
-                    "errors": [{"message": e.message} for e in s.errors],
-                }
-                for name, s in status.items()
-            }
-
-        return result
+            on_add_resource_done(
+                root_uri=result.get("root_uri", ""),
+                wait=wait,
+                result_status=result.get("status", ""),
+                total_duration_ms=round((time.perf_counter() - request_start) * 1000, 3),
+            )
+            return result
+        except Exception as exc:
+            on_add_resource_error(
+                wait=wait,
+                exc=exc,
+                total_duration_ms=round((time.perf_counter() - request_start) * 1000, 3),
+            )
+            raise
+        finally:
+            unregister_wait_telemetry(telemetry_id)
 
     async def add_skill(
         self,
@@ -156,27 +202,27 @@ class ResourceService:
             Processing result
         """
         self._ensure_initialized()
+        on_add_skill_start(wait=wait)
 
         result = await self._skill_processor.process_skill(
             data=data,
             viking_fs=self._viking_fs,
             ctx=ctx,
         )
+        on_skill_processed(status=result.get("status", ""))
 
         if wait:
             qm = get_queue_manager()
+            wait_start = time.perf_counter()
             try:
                 status = await qm.wait_complete(timeout=timeout)
             except TimeoutError as exc:
+                on_add_skill_queue_wait_timeout(exc)
                 raise DeadlineExceededError("queue processing", timeout) from exc
-            result["queue_status"] = {
-                name: {
-                    "processed": s.processed,
-                    "error_count": s.error_count,
-                    "errors": [{"message": e.message} for e in s.errors],
-                }
-                for name, s in status.items()
-            }
+            on_add_skill_queue_wait_complete(
+                duration_ms=round((time.perf_counter() - wait_start) * 1000, 3)
+            )
+            result["queue_status"] = build_queue_status_payload(status)
 
         return result
 

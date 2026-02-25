@@ -43,6 +43,8 @@ async def test_sdk_add_resource(http_client):
     f.write_text(SAMPLE_MD_CONTENT)
 
     result = await client.add_resource(path=str(f), reason="sdk test", wait=True)
+    assert result["usage"]["duration_ms"] >= 0
+    assert result["usage"]["token_total"] >= 0
     assert "root_uri" in result
     assert result["root_uri"].startswith("viking://")
 
@@ -119,6 +121,40 @@ async def test_sdk_find(http_client):
     result = await client.find(query="sample document", limit=5)
     assert hasattr(result, "resources")
     assert hasattr(result, "total")
+
+
+async def test_sdk_find_telemetry(http_client):
+    client, _ = http_client
+    f = TEST_TMP_DIR / "sdk_search_telemetry.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(SAMPLE_MD_CONTENT)
+    await client.add_resource(
+        path=str(f), reason="telemetry search test", wait=True, telemetry=True
+    )
+
+    result = await client.find(query="sample document", limit=5, telemetry=True)
+    assert not hasattr(result, "telemetry")
+    assert not hasattr(result, "usage")
+
+
+async def test_sdk_find_summary_only_telemetry(http_client):
+    client, _ = http_client
+    f = TEST_TMP_DIR / "sdk_search_summary_only.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(SAMPLE_MD_CONTENT)
+    await client.add_resource(
+        path=str(f),
+        reason="summary only telemetry search test",
+        wait=True,
+    )
+
+    result = await client.find(
+        query="sample document",
+        limit=5,
+        telemetry={"summary": True, "events": False},
+    )
+    assert not hasattr(result, "telemetry")
+    assert not hasattr(result, "usage")
 
 
 # ===================================================================
