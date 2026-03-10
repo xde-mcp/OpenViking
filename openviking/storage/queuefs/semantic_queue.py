@@ -17,6 +17,7 @@ class SemanticQueue(NamedQueue):
 
     async def enqueue(self, msg: SemanticMsg) -> str:
         """Serialize SemanticMsg object and store in queue."""
+        logger.debug(f"[SemanticQueue] Enqueuing message: {msg}")
         return await super().enqueue(msg.to_dict())
 
     async def dequeue(self) -> Optional[SemanticMsg]:

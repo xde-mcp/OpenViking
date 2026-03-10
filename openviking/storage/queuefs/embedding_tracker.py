@@ -62,6 +62,35 @@ class EmbeddingTaskTracker:
                 f"{total_count} tasks"
             )
     
+    async def increment(self, semantic_msg_id: str) -> Optional[int]:
+        """Increment the remaining task count for a SemanticMsg.
+        
+        This method should be called when a new embedding task is added
+        for an already registered SemanticMsg.
+        
+        Args:
+            semantic_msg_id: The ID of the SemanticMsg
+            
+        Returns:
+            The remaining count after increment, or None if not found
+        """
+        async with self._lock:
+            if semantic_msg_id not in self._tasks:
+                logger.debug(f"SemanticMsg {semantic_msg_id} not found in tracker")
+                return None
+            
+            task_info = self._tasks[semantic_msg_id]
+            task_info["remaining"] += 1
+            task_info["total"] += 1
+            remaining = task_info["remaining"]
+            
+            logger.debug(
+                f"Embedding task added for SemanticMsg {semantic_msg_id}: "
+                f"{remaining}/{task_info['total']} remaining"
+            )
+            
+        return remaining
+    
     async def decrement(self, semantic_msg_id: str) -> Optional[int]:
         """Decrement the remaining task count for a SemanticMsg.
         
@@ -101,7 +130,6 @@ class EmbeddingTaskTracker:
                     f"All embedding tasks completed for SemanticMsg {semantic_msg_id}"
                 )
             
-            return remaining
         
         if on_complete:
             try:
@@ -113,6 +141,7 @@ class EmbeddingTaskTracker:
                     f"Error in completion callback for {semantic_msg_id}: {e}",
                     exc_info=True,
                 )
+        return remaining
     
     async def get_status(self, semantic_msg_id: str) -> Optional[Dict[str, Any]]:
         """Get the current status of a SemanticMsg's embedding tasks.

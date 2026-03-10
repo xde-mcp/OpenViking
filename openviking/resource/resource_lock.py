@@ -313,9 +313,10 @@ class ResourceLockManager:
             if not self.exists(self._lock_dir_path):
                 return 0
             
-            lock_files = self._agfs.listdir(self._lock_dir_path)
+            lock_files = self._agfs.ls(self._lock_dir_path)
             
-            for lock_file in lock_files:
+            for file_info in lock_files:
+                lock_file = file_info.get("name", "")
                 if not lock_file.endswith(self.LOCK_FILE_SUFFIX):
                     continue
                 
@@ -349,9 +350,10 @@ class ResourceLockManager:
             if not self.exists(self._lock_dir_path):
                 return 0
             
-            lock_files = self._agfs.listdir(self._lock_dir_path)
+            lock_files = self._agfs.ls(self._lock_dir_path)
             
-            for lock_file in lock_files:
+            for file_info in lock_files:
+                lock_file = file_info.get("name", "")
                 if not lock_file.endswith(self.LOCK_FILE_SUFFIX):
                     continue
                 

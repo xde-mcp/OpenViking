@@ -7,7 +7,10 @@ Handles coordinated writes and self-iteration processes
 as described in the OpenViking design document.
 """
 
+import time
 import traceback
+import urllib.request
+import json
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from openviking.parse.tree_builder import TreeBuilder
@@ -24,12 +27,27 @@ from openviking.resource.resource_lock import (
     ResourceLockConflictError,
     ResourceLockManager,
 )
-from pyagfs.exceptions import AGFSHTTPError
 
 if TYPE_CHECKING:
     from openviking.parse.vlm import VLMProcessor
 
 logger = get_logger(__name__)
+
+#region debug-point
+def _debug_log(event: str, data: Dict[str, Any]) -> None:
+    """Report debug event to Debug Server."""
+    try:
+        payload = json.dumps({"event": event, "data": data}).encode('utf-8')
+        req = urllib.request.Request(
+            "http://127.0.0.1:9527/event",
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        urllib.request.urlopen(req, timeout=1)
+    except Exception:
+        pass
+#endregion
 
 
 class ResourceProcessor:
@@ -119,6 +137,16 @@ class ResourceProcessor:
         3. (Optional) Build vector index
         4. (Optional) Summarize
         """
+        #region debug-point
+        start_time = time.time()
+        _debug_log("process_resource_start", {
+            "path": path,
+            "target": target,
+            "build_index": build_index,
+            "summarize": summarize,
+        })
+        #endregion
+        
         result = {
             "status": "success",
             "errors": [],
@@ -132,9 +160,19 @@ class ResourceProcessor:
         update_ctx = UpdateContext(source_url=path, target_uri=target, request_context=ctx)
         update_ctx.scope = scope
 
-         # 先获得锁资源，判断是否可以进行写操作，以及是否是增量更新模式
+         # 先获得锁资源,判断是否可以进行写操作,以及是否是增量更新模式
         try:
+            #region debug-point
+            lock_start = time.time()
+            #endregion
             await self._acquire_lock(update_ctx)
+            #region debug-point
+            lock_duration = time.time() - lock_start
+            _debug_log("acquire_lock_complete", {
+                "duration_ms": round(lock_duration * 1000, 2),
+                "target": target,
+            })
+            #endregion
         except ResourceLockConflictError as e:
             self._release_lock(update_ctx)
             logger.warning(f"Resource lock conflict: {e}")
@@ -151,6 +189,10 @@ class ResourceProcessor:
 
         # ============ Phase 1: Parse source and writes to temp viking fs ============
         try:
+            #region debug-point
+            parse_start = time.time()
+            _debug_log("parse_start", {"path": path})
+            #endregion
             media_processor = self._get_media_processor()
             # Use reason as instruction fallback so it influences L0/L1
             # generation and improves search relevance as documented.
@@ -161,6 +203,14 @@ class ResourceProcessor:
                     instruction=effective_instruction,
                     **kwargs,
                 )
+            #region debug-point
+            parse_duration = time.time() - parse_start
+            _debug_log("parse_complete", {
+                "duration_ms": round(parse_duration * 1000, 2),
+                "temp_dir": parse_result.temp_dir_path,
+                "source_format": parse_result.source_format,
+            })
+            #endregion
             result["source_path"] = parse_result.source_path or path
             result["meta"] = parse_result.meta
 
@@ -198,10 +248,21 @@ class ResourceProcessor:
 
         # ============ Phase 2: TreeBuilder finalizes from temp (scan + move to AGFS) ============
         try:
+            #region debug-point
+            finalize_start = time.time()
+            _debug_log("finalize_start", {"temp_dir": parse_result.temp_dir_path})
+            #endregion
             with get_viking_fs().bind_request_context(ctx):
                 context_tree = await self.tree_builder.finalize_from_temp(
                     update_ctx=update_ctx,
                 )
+                #region debug-point
+                finalize_duration = time.time() - finalize_start
+                _debug_log("finalize_complete", {
+                    "duration_ms": round(finalize_duration * 1000, 2),
+                    "root_uri": context_tree.root.uri if context_tree and context_tree.root else None,
+                })
+                #endregion
                 if context_tree and context_tree.root:
                     result["root_uri"] = context_tree.root.uri
         except Exception as e:
@@ -227,6 +288,10 @@ class ResourceProcessor:
              # If build_index is False, we skip vectorization.
              skip_vec = not build_index
              try:
+                #region debug-point
+                summarize_start = time.time()
+                _debug_log("summarize_start", {"root_uri": result.get("root_uri")})
+                #endregion
                 await self._get_summarizer().summarize(
                     resource_uris=[result["root_uri"]],
                     ctx=ctx,
@@ -235,6 +300,12 @@ class ResourceProcessor:
                     lock_id=lock_id,
                     **kwargs
                 )
+                #region debug-point
+                summarize_duration = time.time() - summarize_start
+                _debug_log("summarize_complete", {
+                    "duration_ms": round(summarize_duration * 1000, 2),
+                })
+                #endregion
              except Exception as e:
                 logger.error(f"Summarization failed: {e}")
                 result["warnings"] = result.get("warnings", []) + [f"Summarization failed: {e}"]
@@ -243,6 +314,10 @@ class ResourceProcessor:
              # Standard compatibility mode: "Just Index it" usually implies ingestion flow.
              # We assume this means "Ingest and Index", which requires summarization.
              try:
+                #region debug-point
+                auto_index_start = time.time()
+                _debug_log("auto_index_start", {"root_uri": result.get("root_uri")})
+                #endregion
                 await self._get_summarizer().summarize(
                     resource_uris=[result["root_uri"]],
                     ctx=ctx,
@@ -251,10 +326,25 @@ class ResourceProcessor:
                     lock_id=lock_id,
                     **kwargs
                 )
+                #region debug-point
+                auto_index_duration = time.time() - auto_index_start
+                _debug_log("auto_index_complete", {
+                    "duration_ms": round(auto_index_duration * 1000, 2),
+                })
+                #endregion
              except Exception as e:
                 logger.error(f"Auto-index failed: {e}")
                 result["warnings"] = result.get("warnings", []) + [f"Auto-index failed: {e}"]
 
+        #region debug-point
+        total_duration = time.time() - start_time
+        _debug_log("process_resource_complete", {
+            "total_duration_ms": round(total_duration * 1000, 2),
+            "status": result["status"],
+            "root_uri": result.get("root_uri"),
+        })
+        #endregion
+        
         return result
 
 

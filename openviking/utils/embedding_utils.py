@@ -172,6 +172,7 @@ async def vectorize_file(
             return
         
         embedding_msg.semantic_msg_id = semantic_msg_id
+        logger.debug(f"Preparing to enqueue file for vectorization: {file_path}, embedding_msg.context_data={embedding_msg.context_data}")
         await embedding_queue.enqueue(embedding_msg)
         logger.debug(f"Enqueued file for vectorization: {file_path}")
         

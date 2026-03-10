@@ -70,52 +70,42 @@ class SemanticDagExecutor:
         self._root_uri: Optional[str] = None
         self._root_done: Optional[asyncio.Event] = None
         self._stats = DagStats()
-        self._embedding_count = 0
-        self._embedding_count_lock = asyncio.Lock()
-        self._pending_dispatch = 0
-        self._dispatch_done: Optional[asyncio.Event] = None
 
     async def run(self, root_uri: str) -> None:
         """Run DAG execution starting from root_uri."""
-        from .embedding_tracker import EmbeddingTaskTracker
         
         self._root_uri = root_uri
         self._root_done = asyncio.Event()
-        self._dispatch_done = asyncio.Event()
-        self._pending_dispatch = 1
-        
-        await self._dispatch_dir(root_uri, parent_uri=None)
-        
-        await self._dispatch_done.wait()
-        
-        if self._semantic_msg_id and self._embedding_count > 0:
+        from .embedding_tracker import EmbeddingTaskTracker
+        if self._semantic_msg_id and self._lock_resource_uri and self._lock_id:
             tracker = EmbeddingTaskTracker.get_instance()
-            
-            on_complete = None
-            if self._lock_resource_uri and self._lock_id:
-                on_complete = self._processor._create_lock_release_callback(
+            on_complete = self._processor._create_lock_release_callback(
                     self._lock_resource_uri, self._lock_id
                 )
-            
             await tracker.register(
                 semantic_msg_id=self._semantic_msg_id,
-                total_count=self._embedding_count,
+                total_count=1,
                 on_complete=on_complete,
                 metadata={
-                    "uri": root_uri,
+                    "uri": self._root_uri,
                     "lock_resource_uri": self._lock_resource_uri,
-                    "lock_id": self._lock_id
+                    "lock_id": self._lock_id    
                 }
             )
+
         
+        await self._dispatch_dir(root_uri, parent_uri=None)
         await self._root_done.wait()
+        if self._semantic_msg_id and self._lock_resource_uri and self._lock_id:
+            tracker = EmbeddingTaskTracker.get_instance()
+            await tracker.decrement(
+                semantic_msg_id=self._semantic_msg_id,
+            )
 
     async def _dispatch_dir(self, dir_uri: str, parent_uri: Optional[str]) -> None:
         """Lazy-dispatch tasks for a directory when it is triggered."""
         if dir_uri in self._nodes:
-            self._pending_dispatch -= 1
-            if self._pending_dispatch == 0 and self._dispatch_done:
-                self._dispatch_done.set()
+            logger.debug(f"Directory {dir_uri} is already dispatched")
             return
 
         self._parent[dir_uri] = parent_uri
@@ -125,6 +115,7 @@ class SemanticDagExecutor:
             file_index = {path: idx for idx, path in enumerate(file_paths)}
             child_index = {path: idx for idx, path in enumerate(children_dirs)}
             pending = len(children_dirs) + len(file_paths)
+            logger.debug(f"Dispatching directory {dir_uri} with {pending} pending tasks")
 
             node = DirNode(
                 uri=dir_uri,
@@ -142,34 +133,24 @@ class SemanticDagExecutor:
             self._stats.pending_nodes += 1
 
             if pending == 0:
-                self._pending_dispatch -= 1
-                if self._pending_dispatch == 0 and self._dispatch_done:
-                    self._dispatch_done.set()
                 self._schedule_overview(dir_uri)
                 return
 
             for file_path in file_paths:
                 self._stats.total_nodes += 1
+                # File nodes are scheduled immediately: pending -> in_progress.
                 self._stats.pending_nodes += 1
                 self._stats.pending_nodes = max(0, self._stats.pending_nodes - 1)
                 self._stats.in_progress_nodes += 1
-                self._embedding_count += 1
                 asyncio.create_task(self._file_summary_task(dir_uri, file_path))
 
             if children_dirs:
-                self._pending_dispatch += len(children_dirs)
-            
-            self._pending_dispatch -= 1
-            if self._pending_dispatch == 0 and self._dispatch_done:
-                self._dispatch_done.set()
+                logger.debug(f"Enqueued {len(children_dirs)} child directories for dispatch")
             
             for child_uri in children_dirs:
                 asyncio.create_task(self._dispatch_dir(child_uri, dir_uri))
         except Exception as e:
             logger.error(f"Failed to dispatch directory {dir_uri}: {e}", exc_info=True)
-            self._pending_dispatch -= 1
-            if self._pending_dispatch == 0 and self._dispatch_done:
-                self._dispatch_done.set()
             if parent_uri:
                 await self._on_child_done(parent_uri, dir_uri, "")
             elif self._root_done:
@@ -212,6 +193,7 @@ class SemanticDagExecutor:
 
     async def _check_file_content_changed(self, file_path: str) -> bool:
         target_path = self._get_target_file_path(file_path)
+        logger.debug(f"Checking if file {file_path} has changed relative to {target_path}")
         if not target_path:
             return True
         try:
@@ -278,17 +260,22 @@ class SemanticDagExecutor:
 
     async def _file_summary_task(self, parent_uri: str, file_path: str) -> None:
         """Generate file summary and notify parent completion."""
+        logger.debug(f"Starting summary task for file {file_path}")
         file_name = file_path.split("/")[-1]
+        need_vectorize = not self._incremental_update
         try:
             summary_dict = None
             if self._incremental_update:
                 content_changed = await self._check_file_content_changed(file_path)
                 if not content_changed:
                     summary_dict = await self._read_existing_summary(file_path)
+                    need_vectorize = False
+            logger.debug(f"Summary dict for {file_path}: {summary_dict}")
             if summary_dict is None:
                 summary_dict = await self._processor._generate_single_file_summary(
                     file_path, llm_sem=self._llm_sem, ctx=self._ctx
                 )
+                logger.debug(f"Generated summary dict for {file_path}: {summary_dict}")
         except Exception as e:
             logger.warning(f"Failed to generate summary for {file_path}: {e}")
             summary_dict = {"name": file_name, "summary": ""}
@@ -296,21 +283,24 @@ class SemanticDagExecutor:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
 
-        await self._on_file_done(parent_uri, file_path, summary_dict)
-
         try:
-            asyncio.create_task(
-                self._processor._vectorize_single_file(
-                    parent_uri=parent_uri,
-                    context_type=self._context_type,
-                    file_path=file_path,
-                    summary_dict=summary_dict,
-                    ctx=self._ctx,
-                    semantic_msg_id=self._semantic_msg_id,
+            if need_vectorize:
+                logger.debug(f"Scheduling vectorization for {file_path} with summary {summary_dict}")
+                asyncio.create_task(
+                    self._processor._vectorize_single_file(
+                        parent_uri=parent_uri,
+                        context_type=self._context_type,
+                        file_path=file_path,
+                        summary_dict=summary_dict,
+                        ctx=self._ctx,
+                        semantic_msg_id=self._semantic_msg_id,
+                        lock_resource_uri=self._lock_resource_uri,
+                        lock_id=self._lock_id,
+                    )
                 )
-            )
         except Exception as e:
             logger.error(f"Failed to schedule vectorization for {file_path}: {e}", exc_info=True)
+        await self._on_file_done(parent_uri, file_path, summary_dict)
 
     async def _on_file_done(
         self, parent_uri: str, file_path: str, summary_dict: Dict[str, str]
@@ -383,10 +373,6 @@ class SemanticDagExecutor:
         if not node:
             return
 
-        async with node.lock:
-            file_summaries = self._finalize_file_summaries(node)
-            children_abstracts = self._finalize_children_abstracts(node)
-
         try:
             overview = None
             abstract = None
@@ -397,6 +383,9 @@ class SemanticDagExecutor:
                 if not children_changed:
                     overview, abstract = await self._read_existing_overview_abstract(dir_uri)
             if overview is None or abstract is None:
+                async with node.lock:
+                    file_summaries = self._finalize_file_summaries(node)
+                    children_abstracts = self._finalize_children_abstracts(node)
                 async with self._llm_sem:
                     overview = await self._processor._generate_overview(
                         dir_uri, file_summaries, children_abstracts
@@ -410,10 +399,12 @@ class SemanticDagExecutor:
                 logger.warning(f"Failed to write overview/abstract for {dir_uri}: {e}")
 
             try:
-                self._embedding_count += 2
+                logger.debug(f"Enqueued directory L0 (abstract) for vectorization: {dir_uri}")
                 await self._processor._vectorize_directory_simple(
                     dir_uri, self._context_type, abstract, overview, ctx=self._ctx,
-                    semantic_msg_id=self._semantic_msg_id
+                    semantic_msg_id=self._semantic_msg_id,
+                    lock_resource_uri=self._lock_resource_uri,
+                    lock_id=self._lock_id,
                 )
             except Exception as e:
                 logger.error(f"Failed to vectorize directory {dir_uri}: {e}", exc_info=True)

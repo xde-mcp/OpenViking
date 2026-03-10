@@ -29,6 +29,9 @@ from openviking_cli.utils import VikingURI
 from openviking_cli.utils.config import get_openviking_config
 from openviking_cli.utils.logger import get_logger
 
+
+from .embedding_tracker import EmbeddingTaskTracker
+
 logger = get_logger(__name__)
 
 
@@ -363,8 +366,8 @@ class SemanticProcessor(DequeueHandlerBase):
             try:
                 from openviking.resource.resource_lock import ResourceLockManager
                 viking_fs = get_viking_fs()
-                if viking_fs:
-                    lock_manager = ResourceLockManager(viking_fs)
+                if hasattr(viking_fs, 'agfs') and viking_fs.agfs:
+                    lock_manager = ResourceLockManager(viking_fs.agfs)
                     success = lock_manager.release_lock(
                         resource_uri=lock_resource_uri,
                         lock_id=lock_id,
@@ -374,7 +377,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     else:
                         logger.warning(f"Failed to release lock for resource {lock_resource_uri}, lock_id={lock_id}")
                 else:
-                    logger.warning("Cannot release lock: viking_fs not available")
+                    logger.warning("Cannot release lock: agfs not available")
             except Exception as e:
                 logger.error(f"Error releasing lock for {lock_resource_uri}: {e}", exc_info=True)
         
@@ -644,6 +647,8 @@ class SemanticProcessor(DequeueHandlerBase):
         overview: str,
         ctx: Optional[RequestContext] = None,
         semantic_msg_id: Optional[str] = None,
+        lock_resource_uri: Optional[str] = "",
+        lock_id: Optional[str] = "",
     ) -> None:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -652,6 +657,14 @@ class SemanticProcessor(DequeueHandlerBase):
             return
 
         from openviking.utils.embedding_utils import vectorize_directory_meta
+        if semantic_msg_id and lock_resource_uri and lock_id:
+            tracker = EmbeddingTaskTracker.get_instance()
+            await tracker.increment(
+                semantic_msg_id=semantic_msg_id,
+            )
+            await tracker.increment(
+                semantic_msg_id=semantic_msg_id
+            )
 
         active_ctx = ctx or self._current_ctx
         await vectorize_directory_meta(
@@ -693,12 +706,19 @@ class SemanticProcessor(DequeueHandlerBase):
         context_type: str,
         file_path: str,
         summary_dict: Dict[str, str],
-        embedding_queue: Optional[Any] = None,
         ctx: Optional[RequestContext] = None,
         semantic_msg_id: Optional[str] = None,
+        lock_resource_uri: Optional[str] = "",
+        lock_id: Optional[str] = "",
     ) -> None:
         """Vectorize a single file using its content or summary."""
         from openviking.utils.embedding_utils import vectorize_file
+
+        if semantic_msg_id and lock_resource_uri and lock_id:
+            tracker = EmbeddingTaskTracker.get_instance()
+            await tracker.increment(
+                semantic_msg_id=semantic_msg_id,
+            )
 
         active_ctx = ctx or self._current_ctx
         await vectorize_file(

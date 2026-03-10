@@ -106,6 +106,9 @@ class TreeBuilder:
 
         # 1. Find document root directory
         entries = await viking_fs.ls(temp_vikingfs_path, ctx=update_ctx.request_context)
+        logger.debug(f"[TreeBuilder] Found {len(entries)} entries in {temp_vikingfs_path}")
+        for e in entries:
+            logger.debug(f"[TreeBuilder] Entry: {e}")
         doc_dirs = [e for e in entries if e.get("isDir") and e["name"] not in [".", ".."]]
 
         if len(doc_dirs) != 1:
@@ -115,16 +118,18 @@ class TreeBuilder:
             raise ValueError(
                 f"[TreeBuilder] Expected 1 document directory in {temp_vikingfs_path}, found {len(doc_dirs)}"
             )
-
+        logger.info(f"[TreeBuilder] Found {len(doc_dirs)} document directories in {temp_vikingfs_path}")
         original_name = doc_dirs[0]["name"]
         doc_name = VikingURI.sanitize_segment(original_name)
         temp_doc_uri = f"{temp_vikingfs_path}/{original_name}"  # use original name to find temp dir
+        logger.info(f"[TreeBuilder] Found document directory: {original_name!r} -> {doc_name!r}")
         if original_name != doc_name:
             logger.debug(f"[TreeBuilder] Sanitized doc name: {original_name!r} -> {doc_name!r}")
 
         # 2. Use document name from parser (avoid duplicate logic)
         # Parser already determined the final document name (e.g., "org/repo" for GitHub repos)
         final_doc_name = update_ctx.document_name or doc_name
+        logger.debug(f"[TreeBuilder] Final document name: {final_doc_name!r}, update_ctx.document_name: {update_ctx.document_name!r}, original_name: {original_name!r}")
 
         # 3. Determine base_uri
         auto_base_uri = self._get_base_uri(scope, source_path, source_format)
@@ -143,29 +148,25 @@ class TreeBuilder:
                 repo_name_only = final_doc_name.split("/")[-1]
             else:
                 repo_name_only = final_doc_name
-            candidate_uri = VikingURI(base_uri or auto_base_uri).join(repo_name_only).uri
+            final_uri = VikingURI(base_uri or auto_base_uri).join(repo_name_only).uri
         else:
             if "/" in final_doc_name:
                 parts = final_doc_name.split("/")
                 sanitized_parts = [VikingURI.sanitize_segment(p) for p in parts if p]
                 base_viking_uri = VikingURI(base_uri or auto_base_uri)
-                candidate_uri = VikingURI.build(base_viking_uri.scope, *sanitized_parts)
+                final_uri = VikingURI.build(base_viking_uri.scope, *sanitized_parts)
             else:
-                candidate_uri = VikingURI(base_uri or auto_base_uri).join(final_doc_name).uri
-        final_uri = await self._resolve_unique_uri(candidate_uri, ctx=update_ctx)
-
-        if final_uri != candidate_uri:
-            logger.info(f"[TreeBuilder] Resolved name conflict: {candidate_uri} -> {final_uri}")
-        else:
-            logger.info(f"[TreeBuilder] Finalizing from temp: {final_uri}")
+                final_uri = VikingURI(base_uri or auto_base_uri).join(final_doc_name).uri
+        
+        logger.info(f"[TreeBuilder] Finalizing from temp: {final_uri}")
 
         if update_ctx.is_incremental:
             logger.info(f"[TreeBuilder] Incremental update: {final_uri}")
             # 6. Enqueue to SemanticQueue for async semantic generation
             if trigger_semantic:
                 try:
-                    await self._enqueue_semantic_generation(temp_vikingfs_path, "resource", ctx=update_context)
-                    logger.info(f"[TreeBuilder] Enqueued semantic generation for: {final_uri}")
+                    await self._enqueue_semantic_generation(temp_doc_uri, "resource", ctx=update_context)
+                    logger.info(f"[TreeBuilder] Enqueued semantic generation for: {temp_doc_uri}")
                 except Exception as e:
                     logger.error(f"[TreeBuilder] Failed to enqueue semantic generation: {e}", exc_info=True)
         else:
@@ -189,16 +190,16 @@ class TreeBuilder:
                 except Exception as e:
                     logger.error(f"[TreeBuilder] Failed to enqueue semantic generation: {e}", exc_info=True)
 
-            # 7. Return simple BuildingTree (no scanning needed)
-            tree = BuildingTree(
-                source_path=source_path,
-                source_format=source_format,
-            )
-            tree._root_uri = final_uri
-            
-            # Create a minimal Context object for the root so that tree.root is not None
-            root_context = Context(uri=final_uri)
-            tree.add_context(root_context)
+        # 7. Return simple BuildingTree (no scanning needed)
+        tree = BuildingTree(
+            source_path=source_path,
+            source_format=source_format,
+        )
+        tree._root_uri = final_uri
+        
+        # Create a minimal Context object for the root so that tree.root is not None
+        root_context = Context(uri=final_uri)
+        tree.add_context(root_context)
         
         return tree
 

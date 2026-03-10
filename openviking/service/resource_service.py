@@ -7,6 +7,9 @@ Provides resource management operations: add_resource, add_skill, wait_processed
 """
 
 from typing import Any, Dict, List, Optional
+import time
+import urllib.request
+import json
 
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
@@ -23,6 +26,22 @@ from openviking_cli.utils import get_logger
 from openviking_cli.utils.uri import VikingURI
 
 logger = get_logger(__name__)
+
+#region debug-point
+def _debug_log(event: str, data: Dict[str, Any]) -> None:
+    """Report debug event to Debug Server."""
+    try:
+        payload = json.dumps({"event": event, "data": data}).encode('utf-8')
+        req = urllib.request.Request(
+            "http://127.0.0.1:9527/event",
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        urllib.request.urlopen(req, timeout=1)
+    except Exception:
+        pass
+#endregion
 
 
 class ResourceService:
@@ -114,9 +133,21 @@ class ResourceService:
         )
 
         if wait:
+            #region debug-point
+            wait_start = time.time()
+            _debug_log("wait_complete_start", {"timeout": timeout})
+            #endregion
             qm = get_queue_manager()
             try:
                 status = await qm.wait_complete(timeout=timeout)
+                #region debug-point
+                wait_duration = time.time() - wait_start
+                _debug_log("wait_complete_done", {
+                    "duration_ms": round(wait_duration * 1000, 2),
+                    "status_keys": list(status.keys()) if status else [],
+                })
+                #endregion
+                logger.info(f"wait_complete status: {status}")
             except TimeoutError as exc:
                 raise DeadlineExceededError("queue processing", timeout) from exc
             result["queue_status"] = {

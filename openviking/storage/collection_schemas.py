@@ -165,9 +165,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         if not data:
             return None
 
-        embedding_msg = None
         try:
             queue_data = json.loads(data["data"])
+            # Parse EmbeddingMsg from data
             embedding_msg = EmbeddingMsg.from_dict(queue_data)
             inserted_data = embedding_msg.context_data
 
@@ -176,30 +176,38 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 self.report_success()
                 return None
 
+            # Only process string messages
             if not isinstance(embedding_msg.message, str):
                 logger.debug(f"Skipping non-string message type: {type(embedding_msg.message)}")
                 self.report_success()
                 return data
 
+            # Initialize embedder if not already initialized
             if not self._embedder:
                 from openviking_cli.utils.config import get_openviking_config
 
                 config = get_openviking_config()
                 self._initialize_embedder(config)
 
+            # Generate embedding vector(s)
             if self._embedder:
+                # embed() is a blocking HTTP call; offload to thread pool to avoid
+                # blocking the event loop and allow real concurrency.
                 result: EmbedResult = await asyncio.to_thread(
                     self._embedder.embed, embedding_msg.message
                 )
 
+                # Add dense vector
                 if result.dense_vector:
                     inserted_data["vector"] = result.dense_vector
+                    # Validate vector dimension
                     if len(result.dense_vector) != self._vector_dim:
                         error_msg = f"Dense vector dimension mismatch: expected {self._vector_dim}, got {len(result.dense_vector)}"
                         logger.error(error_msg)
                         self.report_error(error_msg, data)
                         return None
 
+                # Add sparse vector if present
                 if result.sparse_vector:
                     inserted_data["sparse_vector"] = result.sparse_vector
                     logger.debug(f"Generated sparse vector with {len(result.sparse_vector)} terms")
@@ -209,7 +217,9 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 self.report_error(error_msg, data)
                 return None
 
+            # Write to vector database
             try:
+                # Ensure vector DB has deterministic IDs per semantic layer.
                 uri = inserted_data.get("uri")
                 if uri:
                     account_id = inserted_data.get("account_id", "default")
@@ -223,6 +233,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         f"Successfully wrote embedding to database: {record_id} abstract {inserted_data['abstract']} vector {inserted_data['vector'][:5]}"
                     )
             except CollectionNotFoundError as db_err:
+                # During shutdown, queue workers may finish one dequeued item.
                 if self._vikingdb.is_closing:
                     logger.debug(f"Skip embedding write during shutdown: {db_err}")
                     self.report_success()
@@ -257,6 +268,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
                 tracker = EmbeddingTaskTracker.get_instance()
                 try:
+                    logger.debug(f"Decrementing embedding tracker for {embedding_msg.context_data}")
                     await tracker.decrement(embedding_msg.semantic_msg_id)
                 except Exception as tracker_err:
                     logger.warning(f"Failed to decrement embedding tracker: {tracker_err}")

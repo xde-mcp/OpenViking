@@ -6,7 +6,6 @@ import asyncio
 import os
 import re
 from pathlib import Path
-import mimetypes
 from typing import Any, List, Optional, Set, Tuple, Union
 
 from openviking.parse.parsers.constants import (
