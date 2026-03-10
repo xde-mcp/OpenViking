@@ -3,7 +3,8 @@
 """SemanticProcessor: Processes messages from SemanticQueue, generates .abstract.md and .overview.md."""
 
 import asyncio
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from openviking.parse.parsers.constants import (
     CODE_EXTENSIONS,
@@ -33,6 +34,16 @@ from openviking_cli.utils.logger import get_logger
 from .embedding_tracker import EmbeddingTaskTracker
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class DiffResult:
+    """Directory diff result for sync operations."""
+    added_files: List[str] = field(default_factory=list)
+    deleted_files: List[str] = field(default_factory=list)
+    updated_files: List[str] = field(default_factory=list)
+    added_dirs: List[str] = field(default_factory=list)
+    deleted_dirs: List[str] = field(default_factory=list)
 
 
 class SemanticProcessor(DequeueHandlerBase):
@@ -382,6 +393,434 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.error(f"Error releasing lock for {lock_resource_uri}: {e}", exc_info=True)
         
         return release_lock_callback
+
+    def _create_sync_diff_callback(
+        self,
+        root_uri: str,
+        target_uri: str,
+        lock_id: str,
+    ) -> Callable[[], Awaitable[None]]:
+        """
+        Create a callback function to sync directory differences.
+
+        This callback compares root_uri (new content) with target_uri (old content),
+        handles added/updated/deleted files, then cleans up root_uri and releases lock.
+
+        Args:
+            root_uri: Source directory URI (new content)
+            target_uri: Target directory URI (old content)
+            lock_id: Lock ID to release after completion
+
+        Returns:
+            Async callback function
+        """
+        
+        async def sync_diff_callback() -> None:
+            logger.info(
+                f"[SyncDiff] Starting sync diff callback: "
+                f"root_uri={root_uri}, target_uri={target_uri}, lock_id={lock_id}"
+            )
+            
+            if root_uri == target_uri:
+                logger.warning(
+                    f"[SyncDiff] root_uri and target_uri are the same ({root_uri}), "
+                    f"skipping diff comparison and sync operations, releasing lock directly"
+                )
+                try:
+                    viking_fs = get_viking_fs()
+                    from openviking.resource.resource_lock import ResourceLockManager
+                    if hasattr(viking_fs, 'agfs') and viking_fs.agfs:
+                        lock_manager = ResourceLockManager(viking_fs.agfs)
+                        success = lock_manager.release_lock(
+                            resource_uri=target_uri,
+                            lock_id=lock_id,
+                        )
+                        if success:
+                            logger.info(
+                                f"[SyncDiff] Successfully released lock for {target_uri}, lock_id={lock_id}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[SyncDiff] Failed to release lock for {target_uri}, lock_id={lock_id}"
+                            )
+                    else:
+                        logger.warning("[SyncDiff] Cannot release lock: agfs not available")
+                except Exception as e:
+                    logger.error(
+                        f"[SyncDiff] Error releasing lock for {target_uri}: {e}",
+                        exc_info=True
+                    )
+                return
+            
+            try:
+                viking_fs = get_viking_fs()
+                
+                logger.info(f"[SyncDiff] Step 1: Collecting tree info for root_uri={root_uri}")
+                root_tree = await self._collect_tree_info(root_uri)
+                root_dir_count = len(root_tree)
+                root_file_count = sum(len(files) for _, files in root_tree.values())
+                logger.info(
+                    f"[SyncDiff] Root tree collected: {root_dir_count} dirs, {root_file_count} files"
+                )
+                
+                logger.info(f"[SyncDiff] Step 2: Collecting tree info for target_uri={target_uri}")
+                target_tree = await self._collect_tree_info(target_uri)
+                target_dir_count = len(target_tree)
+                target_file_count = sum(len(files) for _, files in target_tree.values())
+                logger.info(
+                    f"[SyncDiff] Target tree collected: {target_dir_count} dirs, {target_file_count} files"
+                )
+                
+                logger.info("[SyncDiff] Step 3: Computing diff between root and target")
+                diff = await self._compute_diff(root_tree, target_tree, root_uri, target_uri)
+                logger.info(
+                    f"[SyncDiff] Diff computed: "
+                    f"added_files={len(diff.added_files)}, "
+                    f"deleted_files={len(diff.deleted_files)}, "
+                    f"updated_files={len(diff.updated_files)}, "
+                    f"added_dirs={len(diff.added_dirs)}, "
+                    f"deleted_dirs={len(diff.deleted_dirs)}"
+                )
+                if diff.added_files:
+                    logger.debug(f"[SyncDiff] Added files: {diff.added_files}")
+                if diff.deleted_files:
+                    logger.debug(f"[SyncDiff] Deleted files: {diff.deleted_files}")
+                if diff.updated_files:
+                    logger.debug(f"[SyncDiff] Updated files: {diff.updated_files}")
+                if diff.added_dirs:
+                    logger.debug(f"[SyncDiff] Added dirs: {diff.added_dirs}")
+                if diff.deleted_dirs:
+                    logger.debug(f"[SyncDiff] Deleted dirs: {diff.deleted_dirs}")
+                
+                logger.info("[SyncDiff] Step 4: Executing sync operations")
+                await self._execute_sync_operations(diff, root_uri, target_uri)
+                logger.info("[SyncDiff] Sync operations completed")
+                
+                logger.info(f"[SyncDiff] Step 5: Deleting root directory {root_uri}")
+                try:
+                    await viking_fs.rm(root_uri, recursive=True, ctx=self._current_ctx)
+                    logger.info(f"[SyncDiff] Successfully deleted root directory: {root_uri}")
+                except Exception as e:
+                    logger.warning(f"[SyncDiff] Failed to delete root directory {root_uri}: {e}")
+                
+                logger.info(f"[SyncDiff] Step 6: Releasing lock for {target_uri}")
+                from openviking.resource.resource_lock import ResourceLockManager
+                if hasattr(viking_fs, 'agfs') and viking_fs.agfs:
+                    lock_manager = ResourceLockManager(viking_fs.agfs)
+                    success = lock_manager.release_lock(
+                        resource_uri=target_uri,
+                        lock_id=lock_id,
+                    )
+                    if success:
+                        logger.info(
+                            f"[SyncDiff] Successfully released lock for {target_uri}, lock_id={lock_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[SyncDiff] Failed to release lock for {target_uri}, lock_id={lock_id}"
+                        )
+                else:
+                    logger.warning("[SyncDiff] Cannot release lock: agfs not available")
+                
+                logger.info(
+                    f"[SyncDiff] Sync diff callback completed successfully: "
+                    f"root_uri={root_uri}, target_uri={target_uri}"
+                )
+                    
+            except Exception as e:
+                logger.error(
+                    f"[SyncDiff] Error in sync_diff_callback: "
+                    f"root_uri={root_uri}, target_uri={target_uri}, lock_id={lock_id}, "
+                    f"error={e}",
+                    exc_info=True
+                )
+        
+        return sync_diff_callback
+
+    async def _collect_tree_info(
+        self,
+        uri: str,
+    ) -> Dict[str, Tuple[List[str], List[str]]]:
+        """
+        Recursively collect directory tree information.
+
+        Args:
+            uri: Directory URI
+
+        Returns:
+            Dictionary: {dir_uri: ([subdir_uris], [file_uris])}
+        """
+        viking_fs = get_viking_fs()
+        result: Dict[str, Tuple[List[str], List[str]]] = {}
+        total_dirs = 0
+        total_files = 0
+        
+        async def collect_recursive(current_uri: str, depth: int = 0) -> None:
+            nonlocal total_dirs, total_files
+            indent = "  " * depth
+            try:
+                logger.debug(f"[SyncDiff]{indent} Listing directory: {current_uri}")
+                entries = await viking_fs.ls(current_uri, ctx=self._current_ctx)
+            except Exception as e:
+                logger.warning(f"[SyncDiff]{indent} Failed to list {current_uri}: {e}")
+                return
+            
+            sub_dirs: List[str] = []
+            files: List[str] = []
+            
+            for entry in entries:
+                name = entry.get("name", "")
+                if not name or name.startswith(".") or name in [".", ".."]:
+                    continue
+                
+                item_uri = VikingURI(current_uri).join(name).uri
+                
+                if entry.get("isDir", False):
+                    sub_dirs.append(item_uri)
+                    total_dirs += 1
+                    await collect_recursive(item_uri, depth + 1)
+                else:
+                    files.append(item_uri)
+                    total_files += 1
+            
+            result[current_uri] = (sub_dirs, files)
+            logger.debug(
+                f"[SyncDiff]{indent} Collected {current_uri}: "
+                f"{len(sub_dirs)} subdirs, {len(files)} files"
+            )
+        
+        await collect_recursive(uri)
+        logger.info(
+            f"[SyncDiff] Tree info collection completed for {uri}: "
+            f"total_dirs={total_dirs}, total_files={total_files}"
+        )
+        return result
+
+    async def _compute_diff(
+        self,
+        root_tree: Dict[str, Tuple[List[str], List[str]]],
+        target_tree: Dict[str, Tuple[List[str], List[str]]],
+        root_uri: str,
+        target_uri: str,
+    ) -> DiffResult:
+        """
+        Compute differences between two directory trees.
+
+        Args:
+            root_tree: Directory tree from root_uri
+            target_tree: Directory tree from target_uri
+            root_uri: Source directory URI
+            target_uri: Target directory URI
+
+        Returns:
+            DiffResult with added/deleted/updated files and directories
+        """
+        logger.debug(f"[SyncDiff] Computing diff: root_uri={root_uri}, target_uri={target_uri}")
+        
+        def get_relative_path(uri: str, base_uri: str) -> str:
+            if uri.startswith(base_uri):
+                rel = uri[len(base_uri):]
+                return rel.lstrip("/")
+            return uri
+        
+        root_files: Set[str] = set()
+        root_dirs: Set[str] = set()
+        target_files: Set[str] = set()
+        target_dirs: Set[str] = set()
+        
+        for dir_uri, (sub_dirs, files) in root_tree.items():
+            rel_dir = get_relative_path(dir_uri, root_uri)
+            if rel_dir:
+                root_dirs.add(rel_dir)
+            for f in files:
+                root_files.add(get_relative_path(f, root_uri))
+            for d in sub_dirs:
+                root_dirs.add(get_relative_path(d, root_uri))
+        
+        for dir_uri, (sub_dirs, files) in target_tree.items():
+            rel_dir = get_relative_path(dir_uri, target_uri)
+            if rel_dir:
+                target_dirs.add(rel_dir)
+            for f in files:
+                target_files.add(get_relative_path(f, target_uri))
+            for d in sub_dirs:
+                target_dirs.add(get_relative_path(d, target_uri))
+        
+        logger.debug(
+            f"[SyncDiff] Root stats: {len(root_files)} files, {len(root_dirs)} dirs"
+        )
+        logger.debug(
+            f"[SyncDiff] Target stats: {len(target_files)} files, {len(target_dirs)} dirs"
+        )
+        
+        added_files_rel = root_files - target_files
+        deleted_files_rel = target_files - root_files
+        common_files = root_files & target_files
+        
+        added_dirs_rel = root_dirs - target_dirs
+        deleted_dirs_rel = target_dirs - root_dirs
+        
+        logger.debug(
+            f"[SyncDiff] File diff: added={len(added_files_rel)}, "
+            f"deleted={len(deleted_files_rel)}, common={len(common_files)}"
+        )
+        logger.debug(
+            f"[SyncDiff] Dir diff: added={len(added_dirs_rel)}, deleted={len(deleted_dirs_rel)}"
+        )
+        
+        updated_files: List[str] = []
+        logger.debug(f"[SyncDiff] Checking content changes for {len(common_files)} common files")
+        for rel_file in common_files:
+            root_file = f"{root_uri}/{rel_file}"
+            target_file = f"{target_uri}/{rel_file}"
+            try:
+                if await self._check_file_content_changed(root_file, target_file):
+                    updated_files.append(root_file)
+                    logger.debug(f"[SyncDiff] File content changed: {rel_file}")
+            except Exception as e:
+                logger.warning(
+                    f"[SyncDiff] Failed to compare file content for {rel_file}: {e}, "
+                    f"treating as unchanged"
+                )
+        
+        added_files = [f"{root_uri}/{f}" for f in added_files_rel]
+        deleted_files = [f"{target_uri}/{f}" for f in deleted_files_rel]
+        added_dirs = [f"{root_uri}/{d}" for d in added_dirs_rel]
+        deleted_dirs = [f"{target_uri}/{d}" for d in deleted_dirs_rel]
+        
+        result = DiffResult(
+            added_files=added_files,
+            deleted_files=deleted_files,
+            updated_files=updated_files,
+            added_dirs=added_dirs,
+            deleted_dirs=deleted_dirs,
+        )
+        
+        logger.info(
+            f"[SyncDiff] Diff computation completed: "
+            f"added_files={len(added_files)}, deleted_files={len(deleted_files)}, "
+            f"updated_files={len(updated_files)}, added_dirs={len(added_dirs)}, "
+            f"deleted_dirs={len(deleted_dirs)}"
+        )
+        
+        return result
+
+    async def _execute_sync_operations(
+        self,
+        diff: DiffResult,
+        root_uri: str,
+        target_uri: str,
+    ) -> None:
+        """
+        Execute sync operations based on diff result.
+
+        Processing order:
+        1. Delete files in target that don't exist in root
+        2. Move added/updated files from root to target
+        3. Delete directories in target that don't exist in root
+
+        Args:
+            diff: DiffResult containing operations to perform
+            root_uri: Source directory URI
+            target_uri: Target directory URI
+        """
+        viking_fs = get_viking_fs()
+        
+        def map_to_target(root_item_uri: str) -> str:
+            if root_item_uri.startswith(root_uri):
+                rel = root_item_uri[len(root_uri):]
+                return f"{target_uri}{rel}" if rel else target_uri
+            return root_item_uri
+        
+        total_deleted = 0
+        total_moved = 0
+        total_failed = 0
+        
+        logger.info(
+            f"[SyncDiff] Starting sync operations: "
+            f"delete={len(diff.deleted_files)}, move={len(diff.added_files) + len(diff.updated_files)}"
+        )
+        
+        if diff.deleted_files:
+            logger.info(f"[SyncDiff] Phase 1: Deleting {len(diff.deleted_files)} files from target")
+        for i, deleted_file in enumerate(diff.deleted_files, 1):
+            try:
+                logger.debug(f"[SyncDiff] Deleting file [{i}/{len(diff.deleted_files)}]: {deleted_file}")
+                await viking_fs.rm(deleted_file, ctx=self._current_ctx)
+                total_deleted += 1
+                logger.info(f"[SyncDiff] Deleted file [{i}/{len(diff.deleted_files)}]: {deleted_file}")
+            except Exception as e:
+                total_failed += 1
+                logger.warning(
+                    f"[SyncDiff] Failed to delete file [{i}/{len(diff.deleted_files)}]: {deleted_file}, error={e}"
+                )
+        
+        if diff.updated_files:
+            logger.info(
+                f"[SyncDiff] Phase 2: Removing {len(diff.updated_files)} old files for update"
+            )
+        for i, updated_file in enumerate(diff.updated_files, 1):
+            target_file = map_to_target(updated_file)
+            try:
+                logger.debug(
+                    f"[SyncDiff] Removing old file for update [{i}/{len(diff.updated_files)}]: {target_file}"
+                )
+                await viking_fs.rm(target_file, ctx=self._current_ctx)
+                logger.info(
+                    f"[SyncDiff] Removed old file for update [{i}/{len(diff.updated_files)}]: {target_file}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[SyncDiff] Failed to remove old file [{i}/{len(diff.updated_files)}]: {target_file}, error={e}"
+                )
+        
+        files_to_move = diff.added_files + diff.updated_files
+        if files_to_move:
+            logger.info(f"[SyncDiff] Phase 3: Moving {len(files_to_move)} files from root to target")
+        for i, root_file in enumerate(files_to_move, 1):
+            target_file = map_to_target(root_file)
+            try:
+                logger.debug(
+                    f"[SyncDiff] Moving file [{i}/{len(files_to_move)}]: {root_file} -> {target_file}"
+                )
+                await viking_fs.mv(root_file, target_file, ctx=self._current_ctx)
+                total_moved += 1
+                logger.info(
+                    f"[SyncDiff] Moved file [{i}/{len(files_to_move)}]: {root_file} -> {target_file}"
+                )
+            except Exception as e:
+                total_failed += 1
+                logger.warning(
+                    f"[SyncDiff] Failed to move file [{i}/{len(files_to_move)}]: "
+                    f"{root_file} -> {target_file}, error={e}"
+                )
+        
+        if diff.deleted_dirs:
+            logger.info(
+                f"[SyncDiff] Phase 4: Deleting {len(diff.deleted_dirs)} directories from target"
+            )
+        for i, deleted_dir in enumerate(
+            sorted(diff.deleted_dirs, key=lambda x: x.count("/"), reverse=True), 1
+        ):
+            try:
+                logger.debug(
+                    f"[SyncDiff] Deleting directory [{i}/{len(diff.deleted_dirs)}]: {deleted_dir}"
+                )
+                await viking_fs.rm(deleted_dir, recursive=True, ctx=self._current_ctx)
+                logger.info(
+                    f"[SyncDiff] Deleted directory [{i}/{len(diff.deleted_dirs)}]: {deleted_dir}"
+                )
+            except Exception as e:
+                total_failed += 1
+                logger.warning(
+                    f"[SyncDiff] Failed to delete directory [{i}/{len(diff.deleted_dirs)}]: "
+                    f"{deleted_dir}, error={e}"
+                )
+        
+        logger.info(
+            f"[SyncDiff] Sync operations completed: "
+            f"deleted={total_deleted}, moved={total_moved}, failed={total_failed}"
+        )
 
     async def _collect_children_abstracts(self, children_uris: List[str]) -> List[Dict[str, str]]:
         """Collect .abstract.md from subdirectories."""

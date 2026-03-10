@@ -79,8 +79,8 @@ class SemanticDagExecutor:
         from .embedding_tracker import EmbeddingTaskTracker
         if self._semantic_msg_id and self._lock_resource_uri and self._lock_id:
             tracker = EmbeddingTaskTracker.get_instance()
-            on_complete = self._processor._create_lock_release_callback(
-                    self._lock_resource_uri, self._lock_id
+            on_complete = self._processor._create_sync_diff_callback(
+                    root_uri,self._lock_resource_uri, self._lock_id
                 )
             await tracker.register(
                 semantic_msg_id=self._semantic_msg_id,
