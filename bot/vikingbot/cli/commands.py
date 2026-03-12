@@ -557,17 +557,8 @@ def chat(
     ),
     config_path: str = typer.Option(
         None, "--config", "-c", help="Path to ov.conf, default .openviking/ov.conf"
-    )
+    ),
 ):
-    """Interact with the agent directly."""
-    if message is not None:
-        # Single-turn mode: only show error logs
-        logger.remove()
-        logger.add(sys.stderr, level="ERROR")
-    elif logs:
-        logger.enable("vikingbot")
-    else:
-        logger.disable("vikingbot")
 
     path = Path(config_path).expanduser() if config_path is not None else None
 
@@ -585,6 +576,29 @@ def chat(
     agent_loop = prepare_agent_loop(
         config, bus, session_manager, cron, quiet=is_single_turn, eval=eval
     )
+
+    # 配置日志：始终输出DEBUG级别到文件，控制台输出按模式区分
+    logger.remove()
+
+    # 输出DEBUG日志到文件，自动轮转保留7天
+    log_file = get_data_dir() / "vikingbot.debug.log"
+    logger.add(
+        log_file,
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
+    )
+
+    # 控制台日志配置
+    if logs:
+        # 开启日志模式控制台输出DEBUG级别
+        logger.add(sys.stderr, level="DEBUG")
+    else:
+        # 默认模式控制台仅输出错误，不显示普通运行日志
+        logger.add(sys.stderr, level="ERROR")
 
     async def run():
         if is_single_turn:
