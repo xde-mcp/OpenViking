@@ -59,6 +59,19 @@ uv pip install -e . --force-reinstall
 
 This command ensures that `setup.py` is re-executed, triggering the compilation of AGFS and C++ components.
 
+For x86 builds, OpenViking now uses explicit build profiles:
+
+- `wheel` builds default to `OV_X86_BUILD_PROFILE=portable`, which emits a single portable extension with runtime SIMD dispatch (`SSE3` baseline plus optional `AVX2/AVX512` kernels).
+- source installs also default to `OV_X86_BUILD_PROFILE=portable`, so local editable installs match wheel behavior and stay portable across x86 machines.
+- `OV_X86_BUILD_PROFILE=native` remains available when you explicitly want `-march=native` for same-machine performance.
+- advanced users can override with `OV_X86_BUILD_PROFILE=fixed` and `OV_X86_SIMD_LEVEL=SSE3|AVX2|AVX512`.
+
+Example native source build:
+
+```bash
+OV_X86_BUILD_PROFILE=native uv pip install -e . --force-reinstall
+```
+
 ### 3. Configure Environment
 
 Create a configuration file `~/.openviking/ov.conf`:

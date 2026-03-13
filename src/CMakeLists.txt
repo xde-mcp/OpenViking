@@ -4,29 +4,64 @@ project(openviking_cpp)
 
 include(CheckCXXCompilerFlag)
 
-set(OV_X86_SIMD_LEVEL "AVX2" CACHE STRING "x86 SIMD level: SSE3|AVX2|AVX512|NATIVE")
+set(OV_X86_BUILD_PROFILE "portable" CACHE STRING "x86 build profile: portable|native|fixed")
+set_property(CACHE OV_X86_BUILD_PROFILE PROPERTY STRINGS portable native fixed)
+set(OV_X86_SIMD_LEVEL "AVX2" CACHE STRING "x86 SIMD level for fixed/native builds: SSE3|AVX2|AVX512|NATIVE")
 set_property(CACHE OV_X86_SIMD_LEVEL PROPERTY STRINGS SSE3 AVX2 AVX512 NATIVE)
+set(OV_X86_PORTABLE_BASELINE "SSE3" CACHE STRING "x86 portable baseline ISA")
+set_property(CACHE OV_X86_PORTABLE_BASELINE PROPERTY STRINGS SSE3)
+option(OV_X86_DISPATCH "Enable runtime SIMD dispatch on x86" OFF)
 
 set(OV_PLATFORM_X86 OFF)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64|i[3-6]86")
     set(OV_PLATFORM_X86 ON)
 endif()
 
+set(OV_X86_AVX2_DISPATCH_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/detail/vector/common/x86/l2_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/detail/vector/common/x86/ip_avx2.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/detail/vector/common/x86/int8_avx2.cpp
+)
+set(OV_X86_AVX512_DISPATCH_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/detail/vector/common/x86/l2_avx512.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/index/detail/vector/common/x86/ip_avx512.cpp
+)
+
+set(OV_X86_PORTABLE_OPTIONAL_SOURCES
+    ${OV_X86_AVX2_DISPATCH_SOURCES}
+    ${OV_X86_AVX512_DISPATCH_SOURCES}
+)
+
 if(OV_PLATFORM_X86)
+    string(TOUPPER "${OV_X86_BUILD_PROFILE}" OV_X86_BUILD_PROFILE_UPPER)
     string(TOUPPER "${OV_X86_SIMD_LEVEL}" OV_X86_SIMD_LEVEL_UPPER)
+    string(TOUPPER "${OV_X86_PORTABLE_BASELINE}" OV_X86_PORTABLE_BASELINE_UPPER)
     set(OV_X86_COMPILE_FLAGS)
 
-    if(OV_X86_SIMD_LEVEL_UPPER STREQUAL "NATIVE")
+    if(OV_X86_BUILD_PROFILE_UPPER STREQUAL "PORTABLE")
+        set(OV_X86_DISPATCH ON)
+        if(NOT OV_X86_PORTABLE_BASELINE_UPPER STREQUAL "SSE3")
+            message(FATAL_ERROR "OV_X86_PORTABLE_BASELINE currently only supports SSE3")
+        endif()
+
+        check_cxx_compiler_flag("-msse3" HAVE_SSE3)
+        if(HAVE_SSE3)
+            list(APPEND OV_X86_COMPILE_FLAGS -msse3)
+        else()
+            message(FATAL_ERROR "Compiler does not support -msse3 for portable x86 builds")
+        endif()
+    elseif(OV_X86_BUILD_PROFILE_UPPER STREQUAL "NATIVE" OR OV_X86_SIMD_LEVEL_UPPER STREQUAL "NATIVE")
         check_cxx_compiler_flag("-march=native" HAVE_MARCH_NATIVE)
         if(HAVE_MARCH_NATIVE)
             list(APPEND OV_X86_COMPILE_FLAGS -march=native)
         else()
-            message(WARNING "-march=native is not supported by this compiler; falling back to AVX2")
+            message(WARNING "-march=native is not supported by this compiler; falling back to fixed AVX2")
+            set(OV_X86_BUILD_PROFILE_UPPER "FIXED")
             set(OV_X86_SIMD_LEVEL_UPPER "AVX2")
         endif()
     endif()
 
-    if(OV_X86_SIMD_LEVEL_UPPER STREQUAL "AVX512")
+    if(OV_X86_BUILD_PROFILE_UPPER STREQUAL "FIXED" AND OV_X86_SIMD_LEVEL_UPPER STREQUAL "AVX512")
         foreach(FLAG -mavx512f -mavx512bw -mavx512dq -mavx512vl)
             string(REPLACE "-" "_" FLAG_VAR_SUFFIX "${FLAG}")
             set(FLAG_VAR "HAVE_${FLAG_VAR_SUFFIX}")
@@ -36,7 +71,7 @@ if(OV_PLATFORM_X86)
             endif()
             list(APPEND OV_X86_COMPILE_FLAGS ${FLAG})
         endforeach()
-    elseif(OV_X86_SIMD_LEVEL_UPPER STREQUAL "AVX2")
+    elseif(OV_X86_BUILD_PROFILE_UPPER STREQUAL "FIXED" AND OV_X86_SIMD_LEVEL_UPPER STREQUAL "AVX2")
         check_cxx_compiler_flag("-mavx2" HAVE_MAVX2)
         if(HAVE_MAVX2)
             list(APPEND OV_X86_COMPILE_FLAGS -mavx2)
@@ -55,7 +90,7 @@ if(OV_PLATFORM_X86)
         endif()
     endif()
 
-    if(OV_X86_SIMD_LEVEL_UPPER STREQUAL "SSE3")
+    if(OV_X86_BUILD_PROFILE_UPPER STREQUAL "FIXED" AND OV_X86_SIMD_LEVEL_UPPER STREQUAL "SSE3")
         check_cxx_compiler_flag("-msse3" HAVE_SSE3)
         if(HAVE_SSE3)
             list(APPEND OV_X86_COMPILE_FLAGS -msse3)
@@ -69,7 +104,41 @@ if(OV_PLATFORM_X86)
         add_compile_options(${OV_X86_COMPILE_FLAGS})
     endif()
 
-    message(STATUS "OpenViking x86 SIMD level: ${OV_X86_SIMD_LEVEL_UPPER}")
+    if(OV_X86_DISPATCH)
+        add_compile_definitions(OV_X86_RUNTIME_DISPATCH=1)
+        check_cxx_compiler_flag("-mavx2" HAVE_PORTABLE_MAVX2)
+        if(HAVE_PORTABLE_MAVX2)
+            set_source_files_properties(${OV_X86_AVX2_DISPATCH_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "-mavx2")
+            add_compile_definitions(OV_X86_AVX2_DISPATCH_COMPILED=1)
+        endif()
+
+        set(OV_X86_AVX512_COMPILE_FLAGS)
+        set(OV_CAN_BUILD_AVX512_DISPATCH ON)
+        foreach(FLAG -mavx512f -mavx512bw -mavx512dq -mavx512vl)
+            string(REPLACE "-" "_" FLAG_VAR_SUFFIX "${FLAG}")
+            set(FLAG_VAR "HAVE_PORTABLE_${FLAG_VAR_SUFFIX}")
+            check_cxx_compiler_flag("${FLAG}" ${FLAG_VAR})
+            if(${FLAG_VAR})
+                list(APPEND OV_X86_AVX512_COMPILE_FLAGS ${FLAG})
+            else()
+                set(OV_CAN_BUILD_AVX512_DISPATCH OFF)
+            endif()
+        endforeach()
+
+        if(OV_CAN_BUILD_AVX512_DISPATCH)
+            set_source_files_properties(${OV_X86_AVX512_DISPATCH_SOURCES}
+                PROPERTIES COMPILE_OPTIONS "${OV_X86_AVX512_COMPILE_FLAGS}")
+            add_compile_definitions(OV_X86_AVX512_DISPATCH_COMPILED=1)
+        endif()
+    endif()
+
+    message(STATUS "OpenViking x86 build profile: ${OV_X86_BUILD_PROFILE_UPPER}")
+    if(OV_X86_DISPATCH)
+        message(STATUS "OpenViking x86 portable baseline: ${OV_X86_PORTABLE_BASELINE_UPPER}")
+    else()
+        message(STATUS "OpenViking x86 SIMD level: ${OV_X86_SIMD_LEVEL_UPPER}")
+    endif()
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -152,6 +221,20 @@ file(GLOB_RECURSE ALL_SOURCES
     "store/*.cpp"
     "common/*.cpp"
 )
+
+list(REMOVE_ITEM ALL_SOURCES ${OV_X86_PORTABLE_OPTIONAL_SOURCES})
+
+set(OV_X86_PORTABLE_SOURCES)
+if(OV_PLATFORM_X86 AND OV_X86_DISPATCH)
+    if(HAVE_PORTABLE_MAVX2)
+        list(APPEND OV_X86_PORTABLE_SOURCES ${OV_X86_AVX2_DISPATCH_SOURCES})
+    endif()
+    if(OV_CAN_BUILD_AVX512_DISPATCH)
+        list(APPEND OV_X86_PORTABLE_SOURCES ${OV_X86_AVX512_DISPATCH_SOURCES})
+    endif()
+endif()
+
+list(APPEND ALL_SOURCES ${OV_X86_PORTABLE_SOURCES})
 
 add_library(
     engine_impl

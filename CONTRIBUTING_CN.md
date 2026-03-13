@@ -59,6 +59,19 @@ uv pip install -e . --force-reinstall
 
 该命令会强制重新执行 `setup.py`，触发 AGFS 和 C++ 组件的编译与安装。
 
+对于 x86 构建，OpenViking 现在提供明确的构建 profile：
+
+- `wheel` 默认使用 `OV_X86_BUILD_PROFILE=portable`，产出单个可移植扩展，并在运行时自动在 `SSE3` 基线与可选的 `AVX2/AVX512` kernel 之间分派。
+- 源码安装也默认使用 `OV_X86_BUILD_PROFILE=portable`，让本地 editable 安装与 wheel 行为一致，并保持跨 x86 机器可移植。
+- 如果你明确需要本机最佳性能，仍可显式设置 `OV_X86_BUILD_PROFILE=native` 以启用 `-march=native`。
+- 高级用户可以用 `OV_X86_BUILD_PROFILE=fixed` 配合 `OV_X86_SIMD_LEVEL=SSE3|AVX2|AVX512` 强制固定 ISA。
+
+本机优化源码构建示例：
+
+```bash
+OV_X86_BUILD_PROFILE=native uv pip install -e . --force-reinstall
+```
+
 ### 3. 配置环境
 
 创建配置文件 `~/.openviking/ov.conf`：

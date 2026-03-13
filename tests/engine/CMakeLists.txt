@@ -29,3 +29,12 @@ target_link_libraries(test_index_engine PRIVATE
     engine_impl
     Threads::Threads
 )
+
+add_executable(test_x86_simd_dispatch
+    test_x86_simd_dispatch.cpp
+)
+
+target_link_libraries(test_x86_simd_dispatch PRIVATE
+    engine_impl
+    Threads::Threads
+)
