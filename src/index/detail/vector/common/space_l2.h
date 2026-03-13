@@ -5,6 +5,10 @@
 #include "vector_base.h"
 #include <cmath>
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#include "x86/simd_dispatch.h"
+#endif
+
 namespace vectordb {
 
 // Basic L2 squared distance implementation
@@ -121,6 +125,33 @@ static float l2_sqr_sse(const void* v1, const void* v2, const void* params) {
 }
 #endif
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+float l2_sqr_avx2_kernel(const void* v1, const void* v2, const void* params);
+#endif
+#if defined(OV_X86_AVX512_DISPATCH_COMPILED)
+float l2_sqr_avx512_kernel(const void* v1, const void* v2, const void* params);
+#endif
+
+static MetricFunc<float> resolve_l2_metric_x86() {
+  switch (GetPortableX86SimdBackend()) {
+#if defined(OV_X86_AVX512_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx512:
+      return l2_sqr_avx512_kernel;
+#endif
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx2:
+      return l2_sqr_avx2_kernel;
+#endif
+    case X86SimdBackend::kSse3:
+      return l2_sqr_sse;
+    case X86SimdBackend::kScalar:
+    default:
+      return l2_sqr_ref;
+  }
+}
+#endif
+
 #if defined(OV_SIMD_NEON)
 #include "krl.h"
 
@@ -142,6 +173,8 @@ class L2Space : public VectorSpace<float> {
     // In a real scenario, we might want dynamic dispatch based on CPUID
 #if defined(OV_SIMD_NEON)
     metric_func_ = l2_sqr_neon;
+#elif defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+    metric_func_ = resolve_l2_metric_x86();
 #elif defined(OV_SIMD_AVX512)
     metric_func_ = l2_sqr_avx512;
 #elif defined(OV_SIMD_AVX)

@@ -5,6 +5,10 @@
 #include "vector_base.h"
 #include <cmath>
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#include "x86/simd_dispatch.h"
+#endif
+
 namespace vectordb {
 
 static float inner_product_ref(const void* v1, const void* v2,
@@ -108,6 +112,35 @@ static float inner_product_sse(const void* v1, const void* v2,
 }
 #endif
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+float inner_product_avx2_kernel(const void* v1, const void* v2,
+                                const void* params);
+#endif
+#if defined(OV_X86_AVX512_DISPATCH_COMPILED)
+float inner_product_avx512_kernel(const void* v1, const void* v2,
+                                  const void* params);
+#endif
+
+static MetricFunc<float> resolve_ip_metric_x86() {
+  switch (GetPortableX86SimdBackend()) {
+#if defined(OV_X86_AVX512_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx512:
+      return inner_product_avx512_kernel;
+#endif
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx2:
+      return inner_product_avx2_kernel;
+#endif
+    case X86SimdBackend::kSse3:
+      return inner_product_sse;
+    case X86SimdBackend::kScalar:
+    default:
+      return inner_product_ref;
+  }
+}
+#endif
+
 #if defined(OV_SIMD_NEON)
 #include "krl.h"
 
@@ -128,6 +161,8 @@ class InnerProductSpace : public VectorSpace<float> {
   explicit InnerProductSpace(size_t dim) : dim_(dim) {
 #if defined(OV_SIMD_NEON)
     metric_func_ = inner_product_neon;
+#elif defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+    metric_func_ = resolve_ip_metric_x86();
 #elif defined(OV_SIMD_AVX512)
     metric_func_ = inner_product_avx512;
 #elif defined(OV_SIMD_AVX)

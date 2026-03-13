@@ -8,6 +8,10 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#include "x86/simd_dispatch.h"
+#endif
+
 #if defined(OV_SIMD_AVX)
 #include <immintrin.h>
 #endif
@@ -156,10 +160,51 @@ static float l2_distance_int8(const void* v1, const void* v2,
   return std::max(0.0f, dist);
 }
 
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+float inner_product_distance_int8_avx2_kernel(const void* v1, const void* v2,
+                                              const void* params);
+float l2_distance_int8_avx2_kernel(const void* v1, const void* v2,
+                                   const void* params);
+#endif
+
+static MetricFunc<float> resolve_inner_product_int8_metric_x86() {
+  switch (GetPortableX86SimdBackend()) {
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx2:
+    case X86SimdBackend::kAvx512:
+      return inner_product_distance_int8_avx2_kernel;
+#endif
+    case X86SimdBackend::kSse3:
+    case X86SimdBackend::kScalar:
+    default:
+      return inner_product_distance_int8;
+  }
+}
+
+static MetricFunc<float> resolve_l2_int8_metric_x86() {
+  switch (GetPortableX86SimdBackend()) {
+#if defined(OV_X86_AVX2_DISPATCH_COMPILED)
+    case X86SimdBackend::kAvx2:
+    case X86SimdBackend::kAvx512:
+      return l2_distance_int8_avx2_kernel;
+#endif
+    case X86SimdBackend::kSse3:
+    case X86SimdBackend::kScalar:
+    default:
+      return l2_distance_int8;
+  }
+}
+#endif
+
 class InnerProductSpaceInt8 : public VectorSpace<float> {
  public:
   explicit InnerProductSpaceInt8(size_t dim) : dim_(dim) {
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+    metric_func_ = resolve_inner_product_int8_metric_x86();
+#else
     metric_func_ = inner_product_distance_int8;
+#endif
   }
 
   size_t get_vector_byte_size() const override {
@@ -183,7 +228,11 @@ class InnerProductSpaceInt8 : public VectorSpace<float> {
 class L2SpaceInt8 : public VectorSpace<float> {
  public:
   explicit L2SpaceInt8(size_t dim) : dim_(dim) {
+#if defined(OV_PLATFORM_X86) && defined(OV_X86_RUNTIME_DISPATCH)
+    metric_func_ = resolve_l2_int8_metric_x86();
+#else
     metric_func_ = l2_distance_int8;
+#endif
   }
 
   size_t get_vector_byte_size() const override {

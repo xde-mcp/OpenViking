@@ -10,6 +10,8 @@ import pybind11
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
+from build_support.x86_profiles import resolve_x86_build_config
+
 CMAKE_PATH = shutil.which("cmake") or "cmake"
 C_COMPILER_PATH = shutil.which("gcc") or "gcc"
 CXX_COMPILER_PATH = shutil.which("g++") or "g++"
@@ -335,6 +337,13 @@ class OpenVikingBuildExt(build_ext):
         """Invoke CMake to build the Python native extension."""
         py_output_name = ext_fullpath.stem
         py_output_suffix = ext_fullpath.suffix
+        x86_build_config = resolve_x86_build_config(os.environ, sys.argv)
+        print(
+            "Configuring x86 build profile="
+            f"{x86_build_config.profile} simd={x86_build_config.simd_level} "
+            f"baseline={x86_build_config.baseline} "
+            f"dispatch={'ON' if x86_build_config.dispatch_enabled else 'OFF'}"
+        )
 
         cmake_args = [
             f"-S{Path(ENGINE_SOURCE_DIR).resolve()}",
@@ -351,7 +360,10 @@ class OpenVikingBuildExt(build_ext):
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_C_COMPILER={C_COMPILER_PATH}",
             f"-DCMAKE_CXX_COMPILER={CXX_COMPILER_PATH}",
-            f"-DOV_X86_SIMD_LEVEL={os.environ.get('OV_X86_SIMD_LEVEL', 'AVX2')}",
+            f"-DOV_X86_BUILD_PROFILE={x86_build_config.profile}",
+            f"-DOV_X86_SIMD_LEVEL={x86_build_config.simd_level}",
+            f"-DOV_X86_PORTABLE_BASELINE={x86_build_config.baseline}",
+            f"-DOV_X86_DISPATCH={'ON' if x86_build_config.dispatch_enabled else 'OFF'}",
         ]
 
         if sys.platform == "darwin":

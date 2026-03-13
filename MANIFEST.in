@@ -10,6 +10,7 @@ include LICENSE
 include README.md
 include pyproject.toml
 include setup.py
+recursive-include build_support *.py
 recursive-include openviking *.yaml
 
 # sdist should be source-only: never ship runtime binaries from working tree
